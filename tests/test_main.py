@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pytest
 from tg_compiler.config import AppConfig, TelegramConfig, LMStudioConfig, ChannelConfig
 from tg_compiler import main as main_module
-from tg_compiler.main import _parse_since, purge_old_media
+from tg_compiler.main import _parse_since, purge_old_media, _share_pdf
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +57,40 @@ def test_purge_old_media_removes_old_dirs(tmp_path):
 def test_purge_old_media_missing_base_dir_returns_zero(tmp_path):
     missing = tmp_path / "does-not-exist"
     assert purge_old_media(str(missing), retention_days=30) == 0
+
+
+# ---------------------------------------------------------------------------
+# _share_pdf
+# ---------------------------------------------------------------------------
+
+def test_share_pdf_copies_when_configured(tmp_path):
+    config = AppConfig(
+        telegram=TelegramConfig(api_id=1, api_hash="x", session_name=str(tmp_path / "session"), channels=[]),
+        lmstudio=LMStudioConfig(model="m"),
+    )
+    config.generation.share_to_directory = str(tmp_path / "shared")
+
+    pdf_path = tmp_path / "TheDailyTelegram_2026-06-13_120000.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    _share_pdf(config, pdf_path)
+
+    dest = tmp_path / "shared" / pdf_path.name
+    assert dest.exists()
+    assert dest.read_bytes() == pdf_path.read_bytes()
+
+
+def test_share_pdf_noop_when_not_configured(tmp_path):
+    config = AppConfig(
+        telegram=TelegramConfig(api_id=1, api_hash="x", session_name=str(tmp_path / "session"), channels=[]),
+        lmstudio=LMStudioConfig(model="m"),
+    )
+    pdf_path = tmp_path / "TheDailyTelegram_2026-06-13_120000.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    _share_pdf(config, pdf_path)
+
+    assert list(tmp_path.iterdir()) == [pdf_path]
 
 
 @pytest.fixture
@@ -134,11 +168,11 @@ async def test_run_daemon_logs_scheduler_crash(tmp_path, daemon_config, monkeypa
     import asyncio
     import logging
     import telethon
+    from telethon.tl.types import PeerChannel
 
     daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
 
-    class FakeEntity:
-        id = 1
+    FakeEntity = PeerChannel
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -148,7 +182,7 @@ async def test_run_daemon_logs_scheduler_crash(tmp_path, daemon_config, monkeypa
             return None
 
         async def get_entity(self, identifier):
-            return FakeEntity()
+            return FakeEntity(channel_id=1)
 
         def on(self, *args, **kwargs):
             def decorator(fn):
@@ -171,3 +205,84 @@ async def test_run_daemon_logs_scheduler_crash(tmp_path, daemon_config, monkeypa
         await main_module.run_daemon(daemon_config)
 
     assert any("Daily generation scheduler crashed" in r.message for r in caplog.records)
+
+
+async def test_run_daemon_maps_channel_by_marked_peer_id(tmp_path, daemon_config, monkeypatch, caplog):
+    import asyncio
+    import logging
+    import telethon
+    from telethon import utils as telethon_utils
+    from telethon.tl.types import PeerChannel
+
+    daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
+
+    entity = PeerChannel(channel_id=12345)
+    marked_id = telethon_utils.get_peer_id(entity)
+
+    handlers = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        async def get_entity(self, identifier):
+            return entity
+
+        def on(self, *args, **kwargs):
+            def decorator(fn):
+                handlers.append(fn)
+                return fn
+            return decorator
+
+        async def run_until_disconnected(self):
+            await asyncio.sleep(0.05)
+
+        async def disconnect(self):
+            return None
+
+    async def fake_schedule_daily_generation(config):
+        return None
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def analyze_post(self, record, channel_cfg):
+            from tg_compiler.analyzer import PostAnalysis
+            return PostAnalysis(
+                title="Title", summary="Summary",
+                importance=1, urgency=1, credibility=1, relevance=1,
+                category="Other", key_entities=[], image_description=None,
+                threat_level="LOW",
+            )
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
+    monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+
+    with caplog.at_level(logging.WARNING):
+        await main_module.run_daemon(daemon_config)
+
+    assert handlers, "handle_new_message was not registered"
+    handler = handlers[0]
+
+    class FakeMessage:
+        id = 1
+        text = "hello"
+        date = datetime.now(timezone.utc)
+        photo = None
+        video = None
+        gif = None
+
+    class FakeEvent:
+        chat_id = marked_id
+        message = FakeMessage()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        await handler(FakeEvent())
+
+    assert not any("unmapped channel" in r.message for r in caplog.records)

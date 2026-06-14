@@ -20,6 +20,16 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
+def _share_pdf(config: AppConfig, pdf_path: Path) -> None:
+    if not config.generation.share_to_directory:
+        return
+    dest_dir = Path(config.generation.share_to_directory)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / pdf_path.name
+    shutil.copy2(pdf_path, dest)
+    log.info("Copied briefing to %s", dest)
+
+
 async def generate_daily_briefing(
     config: AppConfig,
     target_date: date,
@@ -78,11 +88,12 @@ async def run_batch(config: AppConfig) -> None:
     analysed_count, skipped_count = await analyzer.process_unanalysed(channel_map)
     log.info("Analysed %d posts (skipped %d)", analysed_count, skipped_count)
 
-    _, content = await generate_daily_briefing(
+    path, content = await generate_daily_briefing(
         config, today, db,
         posts_scraped=total_scraped, posts_analysed=analysed_count, posts_skipped=skipped_count,
     )
     await run_analysis(config, today, main_items=content.main_items)
+    _share_pdf(config, path)
 
 
 def purge_old_media(media_dir: str, retention_days: int) -> int:
@@ -123,17 +134,18 @@ async def schedule_daily_generation(config: AppConfig) -> None:
         db = Database(config.storage.db_path)
         try:
             db.init_schema()
-            _, content = await generate_daily_briefing(config, today, db)
+            path, content = await generate_daily_briefing(config, today, db)
         finally:
             db.close()
         await run_analysis(config, today, main_items=content.main_items)
+        _share_pdf(config, path)
 
         removed = purge_old_media(config.storage.media_dir, config.storage.retention_days)
         log.info("Daily briefing complete. Purged %d old media directories.", removed)
 
 
 async def run_daemon(config: AppConfig) -> None:
-    from telethon import TelegramClient, events
+    from telethon import TelegramClient, events, utils as telethon_utils
     from tg_compiler.analyzer import Analyzer, analysis_to_record
     from tg_compiler.scraper import media_path_for
 
@@ -157,7 +169,7 @@ async def run_daemon(config: AppConfig) -> None:
                 raise ValueError(f"Channel config has neither username nor id: {ch!r}")
             entity = await client.get_entity(identifier)
             channel_entities.append(entity)
-            channel_cfg_by_id[entity.id] = ch
+            channel_cfg_by_id[telethon_utils.get_peer_id(entity)] = ch
 
         @client.on(events.NewMessage(chats=channel_entities))
         async def handle_new_message(event):
@@ -286,10 +298,15 @@ def main() -> None:
         from tg_compiler.synthesiser import run_analysis
         target_date = since_dt.date() if since_dt else datetime.now(timezone.utc).date()
         asyncio.run(run_analysis(cfg, target_date))
+        date_dir = Path(cfg.generation.output_dir) / target_date.isoformat()
+        pdfs = sorted(date_dir.glob("TheDailyTelegram_*.pdf")) if date_dir.exists() else []
+        if pdfs:
+            _share_pdf(cfg, pdfs[-1])
     elif args.generate:
         db = Database(cfg.storage.db_path)
         db.init_schema()
         out, _ = asyncio.run(generate_daily_briefing(cfg, datetime.now(timezone.utc).date(), db))
+        _share_pdf(cfg, out)
         print(f"Generated: {out}")
 
 
