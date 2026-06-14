@@ -3,6 +3,10 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
 
 from tg_compiler.config import TriageConfig
 from tg_compiler.db import PostRecord, AnalysisRecord
@@ -11,9 +15,11 @@ _NON_WORD = re.compile(r'[^\w\s]')
 
 _SEVERITY_RANK: dict[str, int] = {"CRITICAL": 4, "HIGH": 3, "MODERATE": 2, "LOW": 1}
 
-# Aliases for common actors so entity-overlap dedup matches across naming variants.
-# Keys are compared with periods stripped (so "U.S." and "us" both normalize to "us").
-_ENTITY_ALIASES: dict[str, str] = {
+# Built-in aliases for common actors so entity-overlap dedup matches across naming
+# variants. Keys are compared with periods stripped (so "U.S." and "us" both
+# normalize to "us"). Extend or override these via entity_aliases.yaml (gitignored)
+# without editing this file — see entity_aliases.yaml.example.
+_DEFAULT_ENTITY_ALIASES: dict[str, str] = {
     "us": "united states",
     "usa": "united states",
     "united states of america": "united states",
@@ -22,10 +28,22 @@ _ENTITY_ALIASES: dict[str, str] = {
     "israeli military": "israel defense forces",
 }
 
+_ENTITY_ALIASES_PATH = Path("entity_aliases.yaml")
+
+
+@lru_cache(maxsize=1)
+def _entity_aliases() -> dict[str, str]:
+    aliases = dict(_DEFAULT_ENTITY_ALIASES)
+    if _ENTITY_ALIASES_PATH.exists():
+        with open(_ENTITY_ALIASES_PATH) as f:
+            custom = yaml.safe_load(f) or {}
+        aliases.update(custom)
+    return aliases
+
 
 def _normalize_entity(e: str) -> str:
     stripped = e.strip().lower().replace(".", "")
-    return _ENTITY_ALIASES.get(stripped, stripped)
+    return _entity_aliases().get(stripped, stripped)
 
 
 @dataclass

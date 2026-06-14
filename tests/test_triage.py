@@ -1,6 +1,7 @@
 from datetime import datetime, date, timezone, timedelta
 from tg_compiler.db import PostRecord, AnalysisRecord
-from tg_compiler.triage import triage, TriagedPost, BriefingContent, _jaccard, CorroborationRef
+from tg_compiler.triage import triage, TriagedPost, BriefingContent, _jaccard, CorroborationRef, _normalize_entity
+from tg_compiler import triage as triage_module
 from tg_compiler.config import TriageConfig
 
 
@@ -605,3 +606,16 @@ def test_threat_multiplier_ranks_low_below_moderate():
     assert by_id[1] < by_id[2] < by_id[3]
     assert abs(by_id[1] / by_id[2] - 0.85) < 0.01
     assert abs(by_id[3] / by_id[2] - 1.15) < 0.01
+
+
+def test_entity_aliases_loaded_from_custom_file(tmp_path, monkeypatch):
+    alias_file = tmp_path / "entity_aliases.yaml"
+    alias_file.write_text("foo bar: baz corp\n")
+    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", alias_file)
+    triage_module._entity_aliases.cache_clear()
+    try:
+        assert _normalize_entity("Foo Bar") == "baz corp"
+        # built-in defaults still apply alongside custom entries
+        assert _normalize_entity("U.S.") == "united states"
+    finally:
+        triage_module._entity_aliases.cache_clear()

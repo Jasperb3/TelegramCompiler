@@ -1,0 +1,11 @@
+# Custom entity aliases for triage/trends normalization.
+#
+# Copy this file to entity_aliases.yaml (gitignored) and add entries to
+# extend or override the built-in defaults in triage.py without editing
+# code. Keys and values are matched/produced after lowercasing and
+# stripping periods (e.g. "U.S." -> "us").
+#
+# Example:
+# us: united states
+# usa: united states
+# idf: israel defense forces
