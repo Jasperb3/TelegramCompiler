@@ -50,11 +50,9 @@ python --version   # must be 3.11 or newer
 
 Download from [https://lmstudio.ai](https://lmstudio.ai) and install it. You need a Vision-Language Model (VLM) loaded — one that can analyse images alongside text.
 
-Recommended models (small and capable):
+Recommended model (small and capable):
 - `google/gemma-4-12b` — default model, excellent intelligence and vision capabilities
-- `google/gemma-3-4b-it` — good balance of speed and quality
-- `llava-v1.5-7b` — strong multimodal reasoning
-- Any GGUF model with vision support
+- Alternatively you can try a larger GGUF model with vision support
 
 To start the server inside LM Studio: **Local Server → Start Server** (default port 1234).
 
@@ -84,7 +82,7 @@ python -m tg_compiler.main --help
 
 Expected output:
 ```
-usage: tg_compiler [-h] [--config CONFIG] [--batch] [--daemon] [--generate] [--analyse] [--since TIME]
+usage: tg_compiler [-h] [--config CONFIG] [--batch] [--daemon] [--generate] [--analyse] [--since TIME] [--layout {desktop,mobile}]
 ```
 
 ---
@@ -156,6 +154,8 @@ generation:
   output_dir: "./briefings"   # where PDFs and markdown are saved
   generate_at: "23:59"        # daily auto-generation time in daemon mode (HH:MM, in timezone below)
   timezone: "UTC"             # IANA timezone for generate_at (e.g. "Europe/London")
+  pdf_layout: "desktop"       # PDF CSS layout: "desktop" or "mobile" (override with --layout)
+  # share_to_directory: "/path/to/shared/folder"  # if set, copy the final PDF here after generation
   # Intelligence Assessment coverage is governed by triage.max_main_items
 
 storage:
@@ -343,6 +343,20 @@ python -m tg_compiler.main --analyse --since 2026-06-07
 ```
 
 `--analyse` finds the most recent `TheDailyTelegram_*.pdf` in the date subdirectory, re-runs triage to reconstruct the same main-item set as the briefing (recency decay is anchored to that day, so past dates rank identically), synthesises via LM Studio, and prepends the front page. Re-running it replaces the existing front page rather than stacking a second one. Under `--batch` this runs automatically, so `--analyse` is mainly useful after a standalone `--generate`.
+
+### Mobile layout — `--layout`
+
+By default the PDF uses the desktop CSS layout. Pass `--layout mobile` (with `--batch`, `--generate`, or `--daemon`) to use a layout with larger text, tighter margins, and a single-column appendix, optimised for reading on a phone:
+
+```bash
+python -m tg_compiler.main --generate --layout mobile
+```
+
+The default can also be set permanently via `generation.pdf_layout` in `config.yaml` (`"desktop"` or `"mobile"`); `--layout` overrides it for a single run.
+
+### Sharing the PDF — `share_to_directory`
+
+Set `generation.share_to_directory` in `config.yaml` to a directory path, and the final generated PDF (after the intelligence front page has been prepended) is copied there too — e.g. a Syncthing/Dropbox/Nextcloud folder for reading on another device. Leave it unset (the default) to disable this.
 
 ---
 

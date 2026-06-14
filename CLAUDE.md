@@ -38,7 +38,7 @@ python -m tg_compiler.main --batch --since 00:00        # re-scrape from midnigh
 python -m tg_compiler.main --batch --since 2026-06-01   # re-scrape from a specific date
 python -m tg_compiler.main --daemon
 python -m tg_compiler.main --generate
-python -m tg_compiler.main --analyse                    # prepend front page to latest PDF for today
+python -m tg_compiler.main --analyse --layout mobile    # prepend front page to latest PDF for today with mobile CSS layout
 python -m tg_compiler.main --analyse --since 2026-06-07 # prepend front page for a specific date
 ```
 

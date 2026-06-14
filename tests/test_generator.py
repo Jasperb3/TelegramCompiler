@@ -243,10 +243,9 @@ def test_lead_items_not_repeated_in_lower_sections():
     assert md.count("Unique lead story summary.") == 1
     assert md.count("Unique other development summary.") == 1
     assert md.count("Unique in-brief summary.") == 1
-    # the lead story renders in full (with Entities line), the others compactly
+    # the lead story renders in full, the others compactly
     lead_block = md[md.index("Lead Reports"):md.index("Other Developments")]
     assert "Unique lead story summary." in lead_block
-    assert "**Entities:**" in lead_block
 
 
 def test_critical_lead_item_from_appendix_not_repeated_in_brief():

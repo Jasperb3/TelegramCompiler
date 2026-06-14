@@ -53,6 +53,7 @@ generation:
   generate_at: "23:59"              # daily auto-generation time in daemon mode (HH:MM, in the timezone below)
   timezone: "UTC"                   # IANA timezone for generate_at scheduling (e.g. "Europe/London", "America/New_York")
   pdf_layout: "desktop"             # PDF CSS layout: "desktop" or "mobile" (override with --layout)
+  # share_to_directory: "/path/to/shared/folder"  # if set, copy the final PDF here after generation
   # Intelligence Assessment coverage is controlled by triage.max_main_items (default: 50)
 
 storage:

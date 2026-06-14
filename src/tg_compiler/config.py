@@ -67,6 +67,7 @@ class GenerationConfig(BaseModel):
     generate_at: str = "23:59"          # time for daily auto-generation in daemon mode (HH:MM, interpreted in timezone below)
     timezone: str = "UTC"               # IANA timezone name for generate_at scheduling (e.g. "Europe/London")
     pdf_layout: Literal["desktop", "mobile"] = "desktop"  # CSS layout for the generated PDF; override with --layout
+    share_to_directory: str | None = None  # if set, copy the final generated PDF to this directory
 
 
 class StorageConfig(BaseModel):
