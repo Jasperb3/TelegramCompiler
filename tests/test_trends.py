@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 
 from tg_compiler.db import PostRecord, AnalysisRecord
+from tg_compiler import triage as triage_module
 from tg_compiler.trends import compute_trends
 
 
@@ -44,12 +45,20 @@ def test_emerging_entities_unseen_in_prior_days():
     assert trends["emerging_entities"] == ["bahrain"]
 
 
-def test_entity_alias_normalization_merges_history():
+def test_entity_alias_normalization_merges_history(tmp_path, monkeypatch):
+    alias_file = tmp_path / "entity_aliases.yaml"
+    alias_file.write_text("us: united states\n")
+    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", alias_file)
+    triage_module._entity_aliases.cache_clear()
+
     history = [
         _pair(1, 9, "Military", ["U.S."]),
         _pair(2, 8, "Military", ["United States"]),
     ]
-    trends = compute_trends(history, date(2026, 6, 9))
+    try:
+        trends = compute_trends(history, date(2026, 6, 9))
+    finally:
+        triage_module._entity_aliases.cache_clear()
 
     assert trends["emerging_entities"] == []
     by_entity = {d["entity"]: d for d in trends["entity_deltas"]}

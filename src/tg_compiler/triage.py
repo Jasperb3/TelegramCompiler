@@ -15,30 +15,19 @@ _NON_WORD = re.compile(r'[^\w\s]')
 
 _SEVERITY_RANK: dict[str, int] = {"CRITICAL": 4, "HIGH": 3, "MODERATE": 2, "LOW": 1}
 
-# Built-in aliases for common actors so entity-overlap dedup matches across naming
-# variants. Keys are compared with periods stripped (so "U.S." and "us" both
-# normalize to "us"). Extend or override these via entity_aliases.yaml (gitignored)
-# without editing this file — see entity_aliases.yaml.example.
-_DEFAULT_ENTITY_ALIASES: dict[str, str] = {
-    "us": "united states",
-    "usa": "united states",
-    "united states of america": "united states",
-    "idf": "israel defense forces",
-    "israeli defense forces": "israel defense forces",
-    "israeli military": "israel defense forces",
-}
-
+# Aliases for entity-overlap dedup so naming variants of the same actor match
+# (e.g. "U.S." and "United States" both normalize to "united states"). Keys are
+# compared with periods stripped. Defined entirely via entity_aliases.yaml
+# (gitignored, project root) — see entity_aliases.yaml.example. Empty if absent.
 _ENTITY_ALIASES_PATH = Path("entity_aliases.yaml")
 
 
 @lru_cache(maxsize=1)
 def _entity_aliases() -> dict[str, str]:
-    aliases = dict(_DEFAULT_ENTITY_ALIASES)
     if _ENTITY_ALIASES_PATH.exists():
         with open(_ENTITY_ALIASES_PATH) as f:
-            custom = yaml.safe_load(f) or {}
-        aliases.update(custom)
-    return aliases
+            return yaml.safe_load(f) or {}
+    return {}
 
 
 def _normalize_entity(e: str) -> str:

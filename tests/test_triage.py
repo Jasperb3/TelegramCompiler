@@ -381,21 +381,30 @@ def test_executive_items_includes_all_critical_regardless_of_score():
     assert any(t.post.message_id == 99 for t in result.executive_items)
 
 
-def test_entity_alias_normalization_clusters_duplicates():
+def test_entity_alias_normalization_clusters_duplicates(tmp_path, monkeypatch):
     # Same 3 entities under different naming conventions, distinct summaries
     # so only the alias-aware entity-overlap leg can trigger the match.
+    alias_file = tmp_path / "entity_aliases.yaml"
+    alias_file.write_text("acme corp: acme corporation\n")
+    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", alias_file)
+    triage_module._entity_aliases.cache_clear()
+
     base_ts = datetime.now(timezone.utc)
     p1, a1 = make_pair(msg_id=1, importance=5,
                         summary="Forces mass near the northern frontier overnight",
                         timestamp=base_ts)
-    a1.key_entities = ["U.S.", "Israel", "Hezbollah"]
+    a1.key_entities = ["Acme Corp", "Foo", "Bar"]
     p2, a2 = make_pair(msg_id=2, importance=3,
                         summary="Officials describe a tense standoff at the border crossing",
                         timestamp=base_ts + timedelta(minutes=30))
-    a2.key_entities = ["United States", "Israel", "Hezbollah"]
+    a2.key_entities = ["Acme Corporation", "Foo", "Bar"]
 
-    config = TriageConfig(min_composite_score=0.0)
-    result = triage([(p1, a1), (p2, a2)], config)
+    try:
+        config = TriageConfig(min_composite_score=0.0)
+        result = triage([(p1, a1), (p2, a2)], config)
+    finally:
+        triage_module._entity_aliases.cache_clear()
+
     total = len(result.main_items) + len(result.appendix_items)
     assert total == 1
     kept = (result.main_items + result.appendix_items)[0]
@@ -615,7 +624,15 @@ def test_entity_aliases_loaded_from_custom_file(tmp_path, monkeypatch):
     triage_module._entity_aliases.cache_clear()
     try:
         assert _normalize_entity("Foo Bar") == "baz corp"
-        # built-in defaults still apply alongside custom entries
-        assert _normalize_entity("U.S.") == "united states"
+    finally:
+        triage_module._entity_aliases.cache_clear()
+
+
+def test_entity_aliases_empty_without_custom_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", tmp_path / "missing.yaml")
+    triage_module._entity_aliases.cache_clear()
+    try:
+        # with no alias file, normalization is just lowercase + strip periods
+        assert _normalize_entity("U.S.") == "us"
     finally:
         triage_module._entity_aliases.cache_clear()

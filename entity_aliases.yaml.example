@@ -1,11 +1,14 @@
 # Custom entity aliases for triage/trends normalization.
 #
 # Copy this file to entity_aliases.yaml (gitignored) and add entries to
-# extend or override the built-in defaults in triage.py without editing
-# code. Keys and values are matched/produced after lowercasing and
-# stripping periods (e.g. "U.S." -> "us").
+# make entity-overlap dedup and trend tracking treat naming variants of
+# the same actor as one entity. Keys and values are matched/produced
+# after lowercasing and stripping periods (e.g. "U.S." -> "us").
 #
-# Example:
-# us: united states
-# usa: united states
-# idf: israel defense forces
+# This file is empty by default and intentionally not version-controlled,
+# so you can tailor it to whichever actors/regions your channels cover
+# without that list being visible in the public repo.
+#
+# Example format (replace with entities relevant to your channels):
+# acronym: canonical name
+# alternate spelling: canonical name
