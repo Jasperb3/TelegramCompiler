@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient
+from telethon import utils as telethon_utils
 from telethon.errors import ChannelPrivateError, FloodWaitError  # FloodWaitError: only fires if wait > flood_sleep_threshold
 from telethon.tl.types import Message
 
@@ -48,7 +49,11 @@ class Scraper:
 
         try:
             channel_entity = await self._client.get_entity(entity)
-            channel_id = channel_entity.id
+            # Use the marked peer id (-100… form) so posts and cursors share the
+            # daemon's representation (event.chat_id); a bare id would split the
+            # same channel into two UNIQUE(channel_id, message_id) namespaces and
+            # duplicate every message.
+            channel_id = telethon_utils.get_peer_id(channel_entity)
             self.channel_map[channel_id] = channel_cfg
             last_seen = self._db.get_last_seen_id(channel_id)
             max_id_seen = last_seen

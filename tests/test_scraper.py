@@ -60,14 +60,13 @@ async def test_scrape_channel_returns_empty_on_get_entity_failure(db, scraper_co
 
 
 async def test_scrape_channel_does_not_cap_iter_messages_limit(db, scraper_config, monkeypatch):
+    from telethon.tl.types import PeerChannel
+
     channel_cfg = scraper_config.telegram.channels[0]
     scraper = Scraper(scraper_config, db)
 
-    class FakeEntity:
-        id = 12345
-
     async def fake_get_entity(entity):
-        return FakeEntity()
+        return PeerChannel(channel_id=12345)
 
     captured_kwargs = {}
 
@@ -86,3 +85,62 @@ async def test_scrape_channel_does_not_cap_iter_messages_limit(db, scraper_confi
     await scraper.scrape_channel(channel_cfg)
 
     assert captured_kwargs["limit"] is None
+
+
+async def test_scrape_channel_uses_marked_peer_id_for_post_and_cursor(db, scraper_config, monkeypatch):
+    from datetime import datetime, timezone
+    from telethon import utils as telethon_utils
+    from telethon.tl.types import Message, PeerChannel
+
+    channel_cfg = scraper_config.telegram.channels[0]
+    scraper = Scraper(scraper_config, db)
+
+    entity = PeerChannel(channel_id=12345)
+    marked_id = telethon_utils.get_peer_id(entity)
+    assert marked_id < 0  # marked channel ids carry the -100 prefix
+
+    async def fake_get_entity(_):
+        return entity
+
+    def fake_iter_messages(_, **kwargs):
+        async def _gen():
+            yield Message(
+                id=7,
+                peer_id=PeerChannel(12345),
+                date=datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc),
+                message="hello",
+            )
+
+        return _gen()
+
+    monkeypatch.setattr(scraper._client, "get_entity", fake_get_entity)
+    monkeypatch.setattr(scraper._client, "iter_messages", fake_iter_messages)
+
+    posts = await scraper.scrape_channel(channel_cfg)
+
+    # Post is stored under the marked peer id (same representation the daemon uses),
+    # so a later daemon insert of the same message collides on UNIQUE instead of duplicating.
+    assert len(posts) == 1
+    assert posts[0].channel_id == marked_id
+    # Cursor is keyed by the same marked id and advanced to the highest message id.
+    assert db.get_last_seen_id(marked_id) == 7
+    # channel_map (consumed by the analyzer) is keyed by the same id.
+    assert scraper.channel_map[marked_id] is channel_cfg
+
+
+async def test_daemon_and_batch_inserts_collide_on_unique(db):
+    """A message scraped by batch (now marked id) and the same message from the
+    daemon (event.chat_id, marked id) must be the same row, not two."""
+    from datetime import datetime, timezone
+    from tg_compiler.db import PostRecord
+
+    marked_id = -1000000012345
+    record = PostRecord(
+        channel_id=marked_id, channel_name="chan", message_id=7,
+        timestamp=datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc),
+        text="hello", media_paths=[], has_images=False, raw_json="{}",
+    )
+    first = db.insert_post(record)
+    second = db.insert_post(record)
+    assert first is not None
+    assert second is None  # UNIQUE(channel_id, message_id) blocks the duplicate

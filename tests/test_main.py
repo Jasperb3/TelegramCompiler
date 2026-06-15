@@ -286,3 +286,86 @@ async def test_run_daemon_maps_channel_by_marked_peer_id(tmp_path, daemon_config
         await handler(FakeEvent())
 
     assert not any("unmapped channel" in r.message for r in caplog.records)
+
+
+async def test_run_daemon_advances_cursor(tmp_path, daemon_config, monkeypatch):
+    """Daemon must advance channel_cursors so a later --batch doesn't re-walk the
+    window the daemon already captured."""
+    import asyncio
+    import telethon
+    from telethon import utils as telethon_utils
+    from telethon.tl.types import PeerChannel
+    from tg_compiler.db import Database
+
+    daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
+    entity = PeerChannel(channel_id=12345)
+    marked_id = telethon_utils.get_peer_id(entity)
+
+    handlers = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        async def get_entity(self, identifier):
+            return entity
+
+        def on(self, *args, **kwargs):
+            def decorator(fn):
+                handlers.append(fn)
+                return fn
+            return decorator
+
+        async def run_until_disconnected(self):
+            await asyncio.sleep(0.05)
+
+        async def disconnect(self):
+            return None
+
+    async def fake_schedule_daily_generation(config):
+        return None
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def analyze_post(self, record, channel_cfg):
+            from tg_compiler.analyzer import PostAnalysis
+            return PostAnalysis(
+                title="Title", summary="Summary",
+                importance=1, urgency=1, credibility=1, relevance=1,
+                category="Other", key_entities=[], image_description=None,
+                threat_level="LOW",
+            )
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
+    monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+
+    await main_module.run_daemon(daemon_config)
+    handler = handlers[0]
+
+    class FakeMessage:
+        def __init__(self, mid):
+            self.id = mid
+            self.text = "hello"
+            self.date = datetime.now(timezone.utc)
+            self.photo = None
+            self.video = None
+            self.gif = None
+
+    class FakeEvent:
+        def __init__(self, mid):
+            self.chat_id = marked_id
+            self.message = FakeMessage(mid)
+
+    await handler(FakeEvent(10))
+    await handler(FakeEvent(8))   # out-of-order: must not rewind the cursor
+
+    db = Database(daemon_config.storage.db_path)
+    db.init_schema()
+    assert db.get_last_seen_id(marked_id) == 10
+    db.close()

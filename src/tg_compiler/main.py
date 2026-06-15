@@ -209,6 +209,11 @@ async def run_daemon(config: AppConfig) -> None:
                 raw_json="{}",
             )
             post_id = db.insert_post(record)
+            # Advance the per-channel cursor so a later --batch resumes from here
+            # instead of re-walking everything the daemon already captured. Guard
+            # with max() so out-of-order live events never rewind it.
+            if msg.id > db.get_last_seen_id(channel_id):
+                db.set_last_seen_id(channel_id, msg.id)
             if post_id is not None:
                 record.id = post_id
                 try:
