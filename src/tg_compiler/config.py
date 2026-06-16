@@ -34,6 +34,7 @@ class LMStudioConfig(BaseModel):
     api_token: str | None = None
     temperature: float = 0.3
     max_tokens: int = 800
+    synthesis_max_tokens: int = 24000  # token budget for the intel front-page synthesis (large: reasoning models deliberate before emitting JSON)
     max_concurrent_analyses: int = 1  # parallel LLM calls; increase if LM Studio can handle it
 
 

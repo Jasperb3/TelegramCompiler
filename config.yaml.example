@@ -23,6 +23,7 @@ lmstudio:
   # api_token: "lms-..."            # optional — overridden by LM_API_TOKEN env var
   temperature: 0.3
   max_tokens: 800
+  synthesis_max_tokens: 24000       # token budget for the intel front-page synthesis (keep generous: reasoning models deliberate before emitting JSON)
   max_concurrent_analyses: 1        # parallel LLM calls per batch run; increase if your hardware allows
 
 triage:
