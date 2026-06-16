@@ -56,8 +56,13 @@ async def generate_daily_briefing(
     content.posts_scraped = posts_scraped
     content.posts_analysed = posts_analysed
     content.posts_skipped = posts_skipped
-    path = generate_briefing(content, config.generation.output_dir, pdf=True,
-                              layout=layout or config.generation.pdf_layout)
+    # Render off the event loop: markdown-pdf/PyMuPDF is synchronous and CPU-bound,
+    # so running it inline would stall the daemon (live message handling + Telethon
+    # keepalive) for the duration of the render.
+    path = await asyncio.to_thread(
+        generate_briefing, content, config.generation.output_dir, True,
+        layout or config.generation.pdf_layout,
+    )
     log.info("Briefing generated: %s", path)
     return path, content
 
@@ -114,8 +119,29 @@ def purge_old_media(media_dir: str, retention_days: int) -> int:
     return removed
 
 
-async def schedule_daily_generation(config: AppConfig) -> None:
+async def _run_daily_generation(config: AppConfig) -> None:
+    """Run one scheduled generation cycle. Never raises — a transient failure
+    (LM Studio down at the trigger time, a render error, a DB lock) is logged and
+    swallowed so the scheduler loop survives and tries again the next day."""
     from tg_compiler.synthesiser import run_analysis
+
+    today = datetime.now(timezone.utc).date()
+    log.info("Scheduled daily generation starting for %s", today)
+    db = Database(config.storage.db_path)
+    try:
+        db.init_schema()
+        path, content = await generate_daily_briefing(config, today, db)
+        await run_analysis(config, today, main_items=content.main_items)
+        _share_pdf(config, path)
+        removed = purge_old_media(config.storage.media_dir, config.storage.retention_days)
+        log.info("Scheduled daily generation complete: %s (purged %d old media dirs)", path, removed)
+    except Exception:
+        log.exception("Scheduled daily generation failed for %s — will retry next cycle", today)
+    finally:
+        db.close()
+
+
+async def schedule_daily_generation(config: AppConfig) -> None:
     import zoneinfo
     h, m = map(int, config.generation.generate_at.split(":"))
     try:
@@ -128,20 +154,14 @@ async def schedule_daily_generation(config: AppConfig) -> None:
         target = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
+        log.info("Next daily generation scheduled for %s (%s)", target.isoformat(), tz.key)
         await asyncio.sleep((target - now).total_seconds())
-
-        today = datetime.now(timezone.utc).date()
-        db = Database(config.storage.db_path)
+        # Defensive belt-and-braces: _run_daily_generation already swallows its
+        # own errors, but never let an unexpected failure kill the scheduler.
         try:
-            db.init_schema()
-            path, content = await generate_daily_briefing(config, today, db)
-        finally:
-            db.close()
-        await run_analysis(config, today, main_items=content.main_items)
-        _share_pdf(config, path)
-
-        removed = purge_old_media(config.storage.media_dir, config.storage.retention_days)
-        log.info("Daily briefing complete. Purged %d old media directories.", removed)
+            await _run_daily_generation(config)
+        except Exception:
+            log.exception("Daily generation cycle raised unexpectedly — scheduler continuing")
 
 
 async def run_daemon(config: AppConfig) -> None:

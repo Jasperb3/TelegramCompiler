@@ -369,3 +369,96 @@ async def test_run_daemon_advances_cursor(tmp_path, daemon_config, monkeypatch):
     db.init_schema()
     assert db.get_last_seen_id(marked_id) == 10
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# schedule_daily_generation — resilience (Issue 1)
+# ---------------------------------------------------------------------------
+
+async def test_run_daily_generation_swallows_errors(tmp_path, daemon_config, monkeypatch, caplog):
+    """A failed generation cycle must be logged and swallowed, never raised —
+    otherwise the scheduler loop dies and no report is ever produced again."""
+    import logging
+
+    daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
+
+    async def boom(config, today, db, **kwargs):
+        raise RuntimeError("LM Studio down / db locked")
+
+    monkeypatch.setattr(main_module, "generate_daily_briefing", boom)
+
+    with caplog.at_level(logging.ERROR):
+        await main_module._run_daily_generation(daemon_config)  # must not raise
+
+    assert any("generation" in r.message.lower() and r.levelno >= logging.ERROR
+               for r in caplog.records)
+
+
+async def test_scheduler_loop_survives_failed_cycle(daemon_config, monkeypatch, caplog):
+    """One failing cycle must not terminate the loop; it logs and proceeds to
+    schedule the next day."""
+    import asyncio
+    import logging
+
+    daemon_config.generation.generate_at = "00:00"
+    daemon_config.generation.timezone = "UTC"
+
+    cycles = []
+
+    class _StopLoop(Exception):
+        pass
+
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            raise _StopLoop  # break out after the loop has gone round twice
+
+    async def failing_cycle(config):
+        cycles.append(1)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main_module, "_run_daily_generation", failing_cycle)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(_StopLoop):
+            await main_module.schedule_daily_generation(daemon_config)
+
+    assert len(cycles) == 1            # the cycle ran and raised
+    assert len(sleeps) == 2            # loop survived and scheduled the next day
+    assert any("next" in r.message.lower() for r in caplog.records)  # arm-time visibility
+
+
+async def test_generate_daily_briefing_offloads_pdf_render(tmp_path, daemon_config, monkeypatch):
+    """PDF render must run via asyncio.to_thread so the daemon event loop keeps
+    servicing Telegram messages during generation."""
+    import asyncio
+    from tg_compiler.db import Database
+    from tg_compiler.triage import BriefingContent
+
+    daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
+    db = Database(daemon_config.storage.db_path)
+    db.init_schema()
+
+    def fake_generate_briefing(content, output_dir, pdf=False, layout="desktop"):
+        return f"{output_dir}/out.pdf"
+
+    to_thread_calls = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy_to_thread(fn, *args, **kwargs):
+        to_thread_calls.append(fn)
+        return await real_to_thread(fn, *args, **kwargs)
+
+    monkeypatch.setattr("tg_compiler.generator.generate_briefing", fake_generate_briefing)
+    monkeypatch.setattr(asyncio, "to_thread", spy_to_thread)
+
+    path, content = await main_module.generate_daily_briefing(
+        daemon_config, datetime.now(timezone.utc).date(), db
+    )
+    db.close()
+
+    assert str(path).endswith("out.pdf")
+    assert fake_generate_briefing in to_thread_calls  # rendered off the event loop
