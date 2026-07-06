@@ -59,6 +59,30 @@ def test_purge_old_media_missing_base_dir_returns_zero(tmp_path):
     assert purge_old_media(str(missing), retention_days=30) == 0
 
 
+def test_purge_old_media_uses_utc_date_boundary(tmp_path, monkeypatch):
+    """Cutoff must be computed from the UTC date, not naive local time, so the
+    retention boundary doesn't drift by the host's UTC offset."""
+    import tg_compiler.main as main_module
+
+    old_dir = tmp_path / "chan" / "2026-06-05"
+    boundary_dir = tmp_path / "chan" / "2026-06-06"
+    old_dir.mkdir(parents=True)
+    boundary_dir.mkdir(parents=True)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 6, 7, 1, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(main_module, "datetime", FixedDatetime)
+
+    removed = purge_old_media(str(tmp_path), retention_days=1)
+
+    assert removed == 1
+    assert not old_dir.exists()
+    assert boundary_dir.exists()  # exactly at the cutoff date, not yet older than it
+
+
 # ---------------------------------------------------------------------------
 # _share_pdf
 # ---------------------------------------------------------------------------
@@ -151,6 +175,54 @@ async def test_run_batch_continues_after_one_channel_fails(tmp_path, batch_confi
     await main_module.run_batch(batch_config)
 
     assert scraped_channels == ["chan_a", "chan_c"]
+
+
+async def test_run_batch_purges_old_media(tmp_path, batch_config, monkeypatch):
+    batch_config.storage.db_path = str(tmp_path / "db.sqlite")
+    batch_config.storage.media_dir = str(tmp_path / "media")
+
+    class FakeScraper:
+        def __init__(self, config, db):
+            self.channel_map = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def scrape_channel(self, channel_cfg):
+            return []
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def process_unanalysed(self, channel_map=None):
+            return 0, 0
+
+    async def fake_generate_daily_briefing(config, today, db, **kwargs):
+        from tg_compiler.triage import BriefingContent
+        return "fake.pdf", BriefingContent(date=today, main_items=[], appendix_items=[])
+
+    async def fake_run_analysis(config, today, main_items=None):
+        return None
+
+    purge_calls = []
+
+    def fake_purge(media_dir, retention_days):
+        purge_calls.append((media_dir, retention_days))
+        return 0
+
+    monkeypatch.setattr(main_module, "Scraper", FakeScraper)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+    monkeypatch.setattr(main_module, "generate_daily_briefing", fake_generate_daily_briefing)
+    monkeypatch.setattr("tg_compiler.synthesiser.run_analysis", fake_run_analysis)
+    monkeypatch.setattr(main_module, "purge_old_media", fake_purge)
+
+    await main_module.run_batch(batch_config)
+
+    assert purge_calls == [(batch_config.storage.media_dir, batch_config.storage.retention_days)]
 
 
 @pytest.fixture

@@ -100,10 +100,12 @@ async def run_batch(config: AppConfig) -> None:
     )
     await run_analysis(config, today, main_items=content.main_items)
     _share_pdf(config, path)
+    removed = purge_old_media(config.storage.media_dir, config.storage.retention_days)
+    log.info("Purged %d old media directories", removed)
 
 
 def purge_old_media(media_dir: str, retention_days: int) -> int:
-    cutoff = datetime.now() - timedelta(days=retention_days)
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=retention_days)).date()
     base = Path(media_dir)
     if not base.exists():
         return 0
@@ -111,8 +113,8 @@ def purge_old_media(media_dir: str, retention_days: int) -> int:
     for date_dir in base.rglob("????-??-??"):
         if date_dir.is_dir():
             try:
-                dir_date = datetime.strptime(date_dir.name, "%Y-%m-%d")
-                if dir_date < cutoff:
+                dir_date = datetime.strptime(date_dir.name, "%Y-%m-%d").date()
+                if dir_date < cutoff_date:
                     shutil.rmtree(date_dir)
                     removed += 1
             except ValueError:
