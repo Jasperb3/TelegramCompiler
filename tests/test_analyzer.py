@@ -263,6 +263,13 @@ def test_sanitize_escapes_html_in_summary_and_title():
     assert all("<" not in e and ">" not in e for e in result.key_entities)
 
 
+def test_sanitize_escapes_markdown_link_syntax_in_summary():
+    pa = _analysis(summary="See details [click here](https://evil.example) for more.")
+    result = _sanitize(pa)
+    assert "](" not in result.summary
+    assert "&#91;click here&#93;" in result.summary
+
+
 def test_sanitize_escapes_image_description():
     pa = _analysis(image_description="A photo shows troops & vehicles moving near the border.")
     result = _sanitize(pa)

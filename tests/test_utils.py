@@ -3,7 +3,23 @@ import sqlite3
 
 import pytest
 
-from tg_compiler.utils import connect_telegram_client
+from tg_compiler.utils import connect_telegram_client, escape_html
+
+
+def test_escape_html_neutralises_markdown_link_syntax():
+    result = escape_html("[click here](https://evil.example)")
+    assert "](" not in result
+    assert "&#91;click here&#93;" in result
+
+
+def test_escape_html_neutralises_backticks():
+    assert "`" not in escape_html("run `rm -rf /`")
+
+
+def test_escape_html_still_escapes_angle_brackets_and_amp():
+    result = escape_html("<script>alert(1)</script> & co")
+    assert "<" not in result and ">" not in result
+    assert "&amp;" in result
 
 
 class FakeClient:

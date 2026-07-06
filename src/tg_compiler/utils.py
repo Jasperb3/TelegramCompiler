@@ -7,10 +7,13 @@ import sys
 
 
 def escape_html(text: str) -> str:
-    """Escape &, < and > in LLM-derived text so it can't inject markup into rendered output."""
+    """Escape &, < and > in LLM-derived text so it can't inject HTML markup into
+    rendered output, plus [, ] and backtick so it can't form a markdown link/image
+    ([text](url), ![alt](url)) or code span in the rendered markdown document."""
     if not text:
         return text
-    return html.escape(text, quote=False)
+    text = html.escape(text, quote=False)
+    return text.replace("[", "&#91;").replace("]", "&#93;").replace("`", "&#96;")
 
 
 async def connect_telegram_client(client, session_name: str) -> None:
