@@ -144,7 +144,9 @@ class Database:
             )
             self._conn.commit()
             return cur.lastrowid
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE" not in str(e):
+                raise
             return None
 
     def get_post(self, post_id: int) -> PostRecord:

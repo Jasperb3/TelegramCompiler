@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import pytest
 from tg_compiler.db import AnalysisRecord, Database, PostRecord
 
 
@@ -15,6 +16,28 @@ def test_duplicate_post_is_ignored(db, sample_post):
     db.insert_post(sample_post)
     second_id = db.insert_post(sample_post)
     assert second_id is None
+
+
+def test_insert_post_reraises_non_unique_integrity_error(db):
+    import sqlite3
+    from dataclasses import replace
+
+    bad_post = replace(sample_post_factory(), channel_id=None)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.insert_post(bad_post)
+
+
+def sample_post_factory():
+    return PostRecord(
+        channel_id=100,
+        channel_name="test_chan",
+        message_id=999,
+        timestamp=datetime(2026, 6, 7, 12, 0, tzinfo=timezone.utc),
+        text="Hello world",
+        media_paths=[],
+        has_images=False,
+        raw_json="{}",
+    )
 
 
 def test_get_last_seen_id_defaults_to_zero(db):

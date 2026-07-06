@@ -311,6 +311,11 @@ def _prepend_pdf(front_page_path: Path, briefing_path: Path) -> None:
         writer.add_page(page)
     for page in briefing_reader.pages[skip:]:
         writer.add_page(page)
+    if existing_meta:
+        writer.add_metadata({
+            k: str(v) for k, v in existing_meta.items()
+            if isinstance(k, str) and k != "/IntelPages"
+        })
     writer.add_metadata({"/IntelPages": str(len(front_reader.pages))})
 
     fd, tmp_path = tempfile.mkstemp(dir=briefing_path.parent, suffix=".tmp.pdf")

@@ -250,6 +250,34 @@ def test_prepend_pdf_idempotent_on_rerun(tmp_path):
     assert len(result.pages) == 3  # 1 front + 2 briefing, not stacked twice
 
 
+def test_prepend_pdf_preserves_briefing_title_metadata(tmp_path):
+    from pypdf import PdfWriter, PdfReader
+
+    def make_pdf(path, n_pages=1, metadata=None):
+        writer = PdfWriter()
+        for _ in range(n_pages):
+            writer.add_blank_page(width=612, height=792)
+        if metadata:
+            writer.add_metadata(metadata)
+        with open(path, "wb") as f:
+            writer.write(f)
+
+    front = tmp_path / "front.pdf"
+    briefing = tmp_path / "briefing.pdf"
+    make_pdf(front, n_pages=1)
+    make_pdf(briefing, n_pages=2, metadata={"/Title": "The Daily Telegram 2026-06-09"})
+
+    _prepend_pdf(front, briefing)
+
+    result = PdfReader(str(briefing))
+    assert result.metadata.get("/Title") == "The Daily Telegram 2026-06-09"
+
+    # Idempotent re-run must also keep the title.
+    _prepend_pdf(front, briefing)
+    result = PdfReader(str(briefing))
+    assert result.metadata.get("/Title") == "The Daily Telegram 2026-06-09"
+
+
 def test_prepend_pdf_no_tmp_file_left(tmp_path):
     from pypdf import PdfWriter
 
