@@ -170,7 +170,7 @@ def test_max_main_items_cap():
         "Parliament dissolved after vote of no confidence passed",
     ]
     pairs = [make_pair(importance=5, msg_id=i, summary=summaries[i]) for i in range(10)]
-    config = TriageConfig(min_composite_score=0.0, max_main_items=3)
+    config = TriageConfig(min_composite_score=0.0, min_main_items=0, max_main_items=3)
     result = triage(pairs, config)
     assert len(result.main_items) == 3
     assert len(result.appendix_items) == 7

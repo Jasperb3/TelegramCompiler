@@ -1,18 +1,23 @@
 from __future__ import annotations
 import os
+import re
+import zoneinfo
 import yaml
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_GENERATE_AT_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_THREAT_LEVELS = {"CRITICAL", "HIGH", "MODERATE", "LOW"}
 
 
 class ChannelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    slug: str
+    slug: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
     username: str | None = None
     id: int | None = None
-    priority: float = 1.0          # multiplier applied to composite score (0.1–2.0)
-    credibility: float = 1.0       # channel credibility prior, multiplier applied to composite score (0.1–2.0)
+    priority: float = Field(default=1.0, gt=0, le=5)       # multiplier applied to composite score (0.1–2.0)
+    credibility: float = Field(default=1.0, gt=0, le=5)    # channel credibility prior, multiplier applied to composite score (0.1–2.0)
     custom_prompt: str | None = None  # override the default LLM system prompt for this channel
 
 
@@ -42,7 +47,7 @@ class TriageConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     keywords: list[str] = Field(default_factory=list)
     keyword_boost: float = 0.5
-    min_composite_score: float = 2.5
+    min_composite_score: float = 3.5
     min_main_items: int = 15    # if fewer items clear min_composite_score, promote top appendix items to fill
     max_main_items: int = 50
     dedup_window_secs: int = 7200       # max age gap (seconds) for cross-channel dedup
@@ -61,6 +66,26 @@ class TriageConfig(BaseModel):
     dedup_entity_overlap_count: int = 3             # shared entities required within dedup_window_secs
     dedup_entity_cluster_overlap_count: int = 4     # shared entities required within entity_cluster_window_secs
 
+    @field_validator("threat_multipliers")
+    @classmethod
+    def _validate_threat_multiplier_keys(cls, v: dict[str, float]) -> dict[str, float]:
+        unknown = set(v) - _THREAT_LEVELS
+        if unknown:
+            raise ValueError(
+                f"threat_multipliers has unknown key(s) {sorted(unknown)}; "
+                f"must be a subset of {sorted(_THREAT_LEVELS)}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_main_items_bounds(self) -> "TriageConfig":
+        if self.max_main_items > 0 and self.min_main_items > self.max_main_items:
+            raise ValueError(
+                f"min_main_items ({self.min_main_items}) must be <= "
+                f"max_main_items ({self.max_main_items})"
+            )
+        return self
+
 
 class GenerationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -69,6 +94,22 @@ class GenerationConfig(BaseModel):
     timezone: str = "UTC"               # IANA timezone name for generate_at scheduling (e.g. "Europe/London")
     pdf_layout: Literal["desktop", "mobile"] = "desktop"  # CSS layout for the generated PDF; override with --layout
     share_to_directory: str | None = None  # if set, copy the final generated PDF to this directory
+
+    @field_validator("generate_at")
+    @classmethod
+    def _validate_generate_at(cls, v: str) -> str:
+        if not _GENERATE_AT_RE.match(v):
+            raise ValueError(f"generate_at must be HH:MM (24-hour), got: {v!r}")
+        return v
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str) -> str:
+        try:
+            zoneinfo.ZoneInfo(v)
+        except Exception as e:
+            raise ValueError(f"Unknown IANA timezone: {v!r}") from e
+        return v
 
 
 class StorageConfig(BaseModel):
@@ -89,7 +130,7 @@ class AppConfig(BaseModel):
 
 def load_config(path: str, env_override: bool = False) -> AppConfig:
     with open(path) as f:
-        data = yaml.safe_load(f)
+        data = yaml.safe_load(f) or {}
     if env_override:
         if api_id := os.getenv("TG_API_ID"):
             try:
