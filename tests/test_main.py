@@ -462,3 +462,256 @@ async def test_generate_daily_briefing_offloads_pdf_render(tmp_path, daemon_conf
 
     assert str(path).endswith("out.pdf")
     assert fake_generate_briefing in to_thread_calls  # rendered off the event loop
+
+
+async def test_run_daemon_skips_unresolvable_channel_and_continues(tmp_path, monkeypatch, caplog):
+    import asyncio
+    import logging
+    import telethon
+    from telethon.tl.types import PeerChannel
+
+    config = AppConfig(
+        telegram=TelegramConfig(
+            api_id=1, api_hash="x", session_name=str(tmp_path / "session"),
+            channels=[
+                ChannelConfig(slug="chan_bad", username="@chan_bad"),
+                ChannelConfig(slug="chan_good", username="@chan_good"),
+            ],
+        ),
+        lmstudio=LMStudioConfig(model="m"),
+    )
+    config.storage.db_path = str(tmp_path / "db.sqlite")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        async def get_entity(self, identifier):
+            if identifier == "@chan_bad":
+                raise ValueError("channel not found")
+            return PeerChannel(channel_id=1)
+
+        def on(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        async def run_until_disconnected(self):
+            await asyncio.sleep(0.05)
+
+        async def disconnect(self):
+            return None
+
+    async def fake_schedule_daily_generation(cfg):
+        return None
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
+    monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
+
+    with caplog.at_level(logging.ERROR):
+        await main_module.run_daemon(config)
+
+    assert any("Cannot resolve channel chan_bad" in r.message for r in caplog.records)
+
+
+async def test_run_daemon_exits_when_all_channels_unresolvable(tmp_path, monkeypatch):
+    import telethon
+
+    config = AppConfig(
+        telegram=TelegramConfig(
+            api_id=1, api_hash="x", session_name=str(tmp_path / "session"),
+            channels=[ChannelConfig(slug="chan_bad", username="@chan_bad")],
+        ),
+        lmstudio=LMStudioConfig(model="m"),
+    )
+    config.storage.db_path = str(tmp_path / "db.sqlite")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        async def get_entity(self, identifier):
+            raise ValueError("channel not found")
+
+        def on(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
+
+    with pytest.raises(SystemExit):
+        await main_module.run_daemon(config)
+
+
+async def test_run_daemon_honours_max_concurrent_analyses(tmp_path, daemon_config, monkeypatch):
+    import asyncio
+    import telethon
+    from telethon import utils as telethon_utils
+    from telethon.tl.types import PeerChannel
+
+    daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
+    daemon_config.lmstudio.max_concurrent_analyses = 1
+    entity = PeerChannel(channel_id=12345)
+    marked_id = telethon_utils.get_peer_id(entity)
+
+    handlers = []
+    concurrency = {"current": 0, "peak": 0}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        async def get_entity(self, identifier):
+            return entity
+
+        def on(self, *args, **kwargs):
+            def decorator(fn):
+                handlers.append(fn)
+                return fn
+            return decorator
+
+        async def run_until_disconnected(self):
+            await asyncio.sleep(0.05)
+
+        async def disconnect(self):
+            return None
+
+    async def fake_schedule_daily_generation(cfg):
+        return None
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def analyze_post(self, record, channel_cfg):
+            from tg_compiler.analyzer import PostAnalysis
+            concurrency["current"] += 1
+            concurrency["peak"] = max(concurrency["peak"], concurrency["current"])
+            await asyncio.sleep(0.02)
+            concurrency["current"] -= 1
+            return PostAnalysis(
+                title="Title", summary="Summary",
+                importance=1, urgency=1, credibility=1, relevance=1,
+                category="Other", key_entities=[], image_description=None,
+                threat_level="LOW",
+            )
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
+    monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+
+    await main_module.run_daemon(daemon_config)
+    handler = handlers[0]
+
+    class FakeMessage:
+        def __init__(self, mid):
+            self.id = mid
+            self.text = "hello"
+            self.date = datetime.now(timezone.utc)
+            self.photo = None
+            self.video = None
+            self.gif = None
+
+    class FakeEvent:
+        def __init__(self, mid):
+            self.chat_id = marked_id
+            self.message = FakeMessage(mid)
+
+    await asyncio.gather(handler(FakeEvent(1)), handler(FakeEvent(2)), handler(FakeEvent(3)))
+
+    assert concurrency["peak"] == 1
+
+
+async def test_run_daemon_skips_llm_call_after_recent_connection_failure(tmp_path, daemon_config, monkeypatch):
+    import asyncio
+    import httpx
+    import telethon
+    from openai import APIConnectionError
+    from telethon import utils as telethon_utils
+    from telethon.tl.types import PeerChannel
+
+    daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
+    entity = PeerChannel(channel_id=12345)
+    marked_id = telethon_utils.get_peer_id(entity)
+
+    handlers = []
+    call_count = {"n": 0}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        async def get_entity(self, identifier):
+            return entity
+
+        def on(self, *args, **kwargs):
+            def decorator(fn):
+                handlers.append(fn)
+                return fn
+            return decorator
+
+        async def run_until_disconnected(self):
+            await asyncio.sleep(0.05)
+
+        async def disconnect(self):
+            return None
+
+    async def fake_schedule_daily_generation(cfg):
+        return None
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def analyze_post(self, record, channel_cfg):
+            call_count["n"] += 1
+            raise APIConnectionError(request=httpx.Request("POST", "http://localhost"))
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
+    monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+
+    await main_module.run_daemon(daemon_config)
+    handler = handlers[0]
+
+    class FakeMessage:
+        def __init__(self, mid):
+            self.id = mid
+            self.text = "hello"
+            self.date = datetime.now(timezone.utc)
+            self.photo = None
+            self.video = None
+            self.gif = None
+
+    class FakeEvent:
+        def __init__(self, mid):
+            self.chat_id = marked_id
+            self.message = FakeMessage(mid)
+
+    await handler(FakeEvent(1))
+    assert call_count["n"] == 1  # connection error recorded
+
+    await handler(FakeEvent(2))
+    assert call_count["n"] == 1  # second message within backoff window: LLM not called again
+
+    from tg_compiler.db import Database
+    db = Database(daemon_config.storage.db_path)
+    db.init_schema()
+    unanalysed = db.get_unanalysed_posts()
+    assert {p.message_id for p in unanalysed} == {1, 2}

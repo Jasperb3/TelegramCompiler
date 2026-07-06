@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import shutil
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -165,6 +166,7 @@ async def schedule_daily_generation(config: AppConfig) -> None:
 
 
 async def run_daemon(config: AppConfig) -> None:
+    from openai import APIConnectionError
     from telethon import TelegramClient, events, utils as telethon_utils
     from tg_compiler.analyzer import Analyzer, analysis_to_record
     from tg_compiler.scraper import media_path_for
@@ -172,6 +174,9 @@ async def run_daemon(config: AppConfig) -> None:
     db = Database(config.storage.db_path)
     db.init_schema()
     analyzer = Analyzer(config, db)
+    analysis_sem = asyncio.Semaphore(config.lmstudio.max_concurrent_analyses)
+    last_probe_failure: float | None = None
+    PROBE_BACKOFF_SECS = 60
 
     client = TelegramClient(
         config.telegram.session_name,
@@ -187,12 +192,20 @@ async def run_daemon(config: AppConfig) -> None:
             identifier = ch.username or ch.id
             if not identifier:
                 raise ValueError(f"Channel config has neither username nor id: {ch!r}")
-            entity = await client.get_entity(identifier)
+            try:
+                entity = await client.get_entity(identifier)
+            except Exception as e:
+                log.error("Cannot resolve channel %s — skipping for this daemon run: %s", ch.slug, e)
+                continue
             channel_entities.append(entity)
             channel_cfg_by_id[telethon_utils.get_peer_id(entity)] = ch
 
+        if not channel_entities:
+            raise SystemExit("No configured channels could be resolved — daemon cannot start")
+
         @client.on(events.NewMessage(chats=channel_entities))
         async def handle_new_message(event):
+            nonlocal last_probe_failure
             msg = event.message
             channel_id = event.chat_id
             channel_cfg = channel_cfg_by_id.get(channel_id)
@@ -236,11 +249,21 @@ async def run_daemon(config: AppConfig) -> None:
                 db.set_last_seen_id(channel_id, msg.id)
             if post_id is not None:
                 record.id = post_id
+                if (
+                    last_probe_failure is not None
+                    and time.monotonic() - last_probe_failure < PROBE_BACKOFF_SECS
+                ):
+                    log.debug("LM Studio recently unreachable — post %s left queued", msg.id)
+                    return
                 try:
-                    analysis = await analyzer.analyze_post(record, channel_cfg)
+                    async with analysis_sem:
+                        analysis = await analyzer.analyze_post(record, channel_cfg)
                     db.insert_analysis(analysis_to_record(post_id, analysis, config.lmstudio.model))
+                    last_probe_failure = None
                 except Exception as e:
                     log.error("Analysis failed for post %s: %s", msg.id, e)
+                    if isinstance(e, APIConnectionError):
+                        last_probe_failure = time.monotonic()
 
         scheduler_task = asyncio.create_task(schedule_daily_generation(config))
 
