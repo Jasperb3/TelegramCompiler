@@ -200,6 +200,34 @@ async def test_process_unanalysed_skips_short_textonly_post(db, app_config, monk
     assert by_id[2].category == "Analysis"
 
 
+async def test_process_unanalysed_analyses_short_caption_video_post(db, app_config, monkeypatch):
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+    from datetime import datetime, timezone
+
+    video_post = PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 7, tzinfo=timezone.utc),
+        text="Strike footage", media_paths=[], has_images=False, has_video=True, raw_json="{}",
+    )
+    db.insert_post(video_post)
+
+    analyzer = Analyzer(app_config, db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        return _analysis(summary="Video shows strike footage from the area.")
+
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    analysed_count, skipped_count = await analyzer.process_unanalysed()
+    assert analysed_count == 1
+    assert skipped_count == 0
+
+    pairs = db.get_days_posts_with_analyses("2026-06-07")
+    assert pairs[0][1].category == "Analysis"
+
+
 def test_clean_image_insights_rejects_none_provided():
     assert _clean_image_insights("None provided") is None
     assert _clean_image_insights("none provided.") is None

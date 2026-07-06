@@ -77,6 +77,7 @@ class Scraper:
                 media_paths: list[str] = []
                 has_video = bool(msg.video or msg.gif)
 
+                media_failed = False
                 if msg.photo:
                     date_str = msg.date.strftime("%Y-%m-%d")
                     dest = media_path_for(
@@ -96,6 +97,8 @@ class Scraper:
                             media_paths.append(dest)
                         except Exception:
                             log.error("Media download permanently failed for msg %s", msg.id)
+                            media_failed = True
+                            Path(dest).unlink(missing_ok=True)
 
                 ts = msg.date
                 if ts.tzinfo is None:
@@ -108,7 +111,10 @@ class Scraper:
                     timestamp=ts,
                     text=text,
                     media_paths=media_paths,
-                    has_images=bool(media_paths),
+                    # A permanently-failed download still had a photo — keep
+                    # has_images True so the analyzer's content gate doesn't
+                    # treat a short-caption photo post as text-only and skip it.
+                    has_images=bool(media_paths) or media_failed,
                     has_video=has_video,
                     raw_json=json.dumps({"id": msg.id, "text": text}),
                 )

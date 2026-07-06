@@ -364,7 +364,12 @@ class Analyzer:
 
         async def _analyse_and_save(post: PostRecord) -> None:
             nonlocal skipped, failed
-            if len(post.text.strip()) < MIN_CONTENT_CHARS and not post.media_paths:
+            if (
+                len(post.text.strip()) < MIN_CONTENT_CHARS
+                and not post.media_paths
+                and not post.has_video
+                and not post.has_images
+            ):
                 self._db.insert_analysis(AnalysisRecord(
                     post_id=post.id,
                     summary="",

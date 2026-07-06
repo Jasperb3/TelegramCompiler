@@ -128,6 +128,53 @@ async def test_scrape_channel_uses_marked_peer_id_for_post_and_cursor(db, scrape
     assert scraper.channel_map[marked_id] is channel_cfg
 
 
+async def test_permanent_media_download_failure_keeps_has_images_and_cleans_partial_file(
+    db, scraper_config, monkeypatch, tmp_path
+):
+    from datetime import datetime, timezone
+    from telethon.tl.types import Message, PeerChannel
+
+    class FakeMessage(Message):
+        @property
+        def photo(self):
+            return True
+
+    channel_cfg = scraper_config.telegram.channels[0]
+    scraper_config.storage.media_dir = str(tmp_path / "media")
+    scraper = Scraper(scraper_config, db)
+
+    async def fake_get_entity(_):
+        return PeerChannel(12345)
+
+    def fake_iter_messages(_, **kwargs):
+        async def _gen():
+            yield FakeMessage(
+                id=7,
+                peer_id=PeerChannel(12345),
+                date=datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc),
+                message="short caption",
+            )
+        return _gen()
+
+    async def failing_download_media(msg, file):
+        # Simulate a partial write before the failure.
+        Path(file).parent.mkdir(parents=True, exist_ok=True)
+        Path(file).write_bytes(b"partial")
+        raise ConnectionError("network blip")
+
+    monkeypatch.setattr(scraper._client, "get_entity", fake_get_entity)
+    monkeypatch.setattr(scraper._client, "iter_messages", fake_iter_messages)
+    monkeypatch.setattr(scraper._client, "download_media", failing_download_media)
+
+    posts = await scraper.scrape_channel(channel_cfg)
+
+    assert len(posts) == 1
+    assert posts[0].media_paths == []
+    assert posts[0].has_images is True
+    dest = media_path_for(scraper_config.storage.media_dir, channel_cfg.slug, "2026-06-15", 7, "jpg")
+    assert not Path(dest).exists()
+
+
 async def test_daemon_and_batch_inserts_collide_on_unique(db):
     """A message scraped by batch (now marked id) and the same message from the
     daemon (event.chat_id, marked id) must be the same row, not two."""
