@@ -2,6 +2,8 @@ from __future__ import annotations
 import html
 import os
 import re
+import sqlite3
+import sys
 
 
 def escape_html(text: str) -> str:
@@ -9,6 +11,30 @@ def escape_html(text: str) -> str:
     if not text:
         return text
     return html.escape(text, quote=False)
+
+
+async def connect_telegram_client(client, session_name: str) -> None:
+    """Connect a Telethon client without blindly falling into an interactive
+    login prompt. Two callers (batch scraper, daemon) share this so a locked
+    session file or a missing/expired session under a TTY-less process
+    (nohup/systemd) produces an actionable error instead of a silent hang or
+    a cryptic sqlite3 lock error."""
+    try:
+        await client.connect()
+    except sqlite3.OperationalError as e:
+        raise SystemExit(
+            f"Session file '{session_name}.session' is locked — is the daemon "
+            f"(or another batch run) already using it? Stop it or configure a "
+            f"different session_name."
+        ) from e
+    if not await client.is_user_authorized():
+        if sys.stdin.isatty():
+            await client.start()
+        else:
+            raise SystemExit(
+                "Telegram session missing/expired and no TTY for interactive login — "
+                "run 'python -m tg_compiler.main --batch' in a terminal once to authenticate."
+            )
 
 
 def secure_file(path: str) -> None:

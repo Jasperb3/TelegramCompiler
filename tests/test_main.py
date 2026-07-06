@@ -181,6 +181,12 @@ async def test_run_daemon_logs_scheduler_crash(tmp_path, daemon_config, monkeypa
         async def start(self):
             return None
 
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
+
         async def get_entity(self, identifier):
             return FakeEntity(channel_id=1)
 
@@ -227,6 +233,12 @@ async def test_run_daemon_maps_channel_by_marked_peer_id(tmp_path, daemon_config
 
         async def start(self):
             return None
+
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
 
         async def get_entity(self, identifier):
             return entity
@@ -309,6 +321,12 @@ async def test_run_daemon_advances_cursor(tmp_path, daemon_config, monkeypatch):
 
         async def start(self):
             return None
+
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
 
         async def get_entity(self, identifier):
             return entity
@@ -489,6 +507,12 @@ async def test_run_daemon_skips_unresolvable_channel_and_continues(tmp_path, mon
         async def start(self):
             return None
 
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
+
         async def get_entity(self, identifier):
             if identifier == "@chan_bad":
                 raise ValueError("channel not found")
@@ -536,6 +560,12 @@ async def test_run_daemon_exits_when_all_channels_unresolvable(tmp_path, monkeyp
         async def start(self):
             return None
 
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
+
         async def get_entity(self, identifier):
             raise ValueError("channel not found")
 
@@ -573,6 +603,12 @@ async def test_run_daemon_honours_max_concurrent_analyses(tmp_path, daemon_confi
 
         async def start(self):
             return None
+
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
 
         async def get_entity(self, identifier):
             return entity
@@ -656,6 +692,12 @@ async def test_run_daemon_skips_llm_call_after_recent_connection_failure(tmp_pat
 
         async def start(self):
             return None
+
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
 
         async def get_entity(self, identifier):
             return entity

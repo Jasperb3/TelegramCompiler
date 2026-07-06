@@ -269,6 +269,8 @@ Daemon mode runs indefinitely, listening for new messages in real time and gener
 
 > **Important:** The daemon is a live listener only. It processes messages that arrive while it is running — it does **not** backfill historical posts. Always run `--batch` first to catch up on any posts you want in the briefing, then start the daemon.
 
+> **Warning:** Do not run `--batch` (or `--generate`/`--analyse`) while the daemon is running. Both share one Telegram session file and one SQLite database — running them concurrently can lock the session or the database. Stop the daemon first (`Ctrl+C` or `kill`), run the catch-up command, then restart the daemon.
+
 ```bash
 # Recommended startup sequence:
 python -m tg_compiler.main --batch   # catch up on history first

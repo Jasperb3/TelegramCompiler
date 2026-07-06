@@ -15,7 +15,7 @@ load_dotenv()
 from tg_compiler.config import load_config, AppConfig, ChannelConfig
 from tg_compiler.db import Database, PostRecord
 from tg_compiler.scraper import Scraper
-from tg_compiler.utils import secure_file
+from tg_compiler.utils import connect_telegram_client, secure_file
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -183,7 +183,7 @@ async def run_daemon(config: AppConfig) -> None:
         config.telegram.api_id,
         config.telegram.api_hash,
     )
-    await client.start()
+    await connect_telegram_client(client, config.telegram.session_name)
     secure_file(f"{config.telegram.session_name}.session")
     try:
         channel_entities = []
