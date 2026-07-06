@@ -636,3 +636,18 @@ def test_entity_aliases_empty_without_custom_file(tmp_path, monkeypatch):
         assert _normalize_entity("U.S.") == "us"
     finally:
         triage_module._entity_aliases.cache_clear()
+
+
+def test_entity_aliases_malformed_yaml_ignored_with_warning(tmp_path, monkeypatch, caplog):
+    import logging
+
+    alias_file = tmp_path / "entity_aliases.yaml"
+    alias_file.write_text("- foo\n- bar\n")  # a list, not a str->str mapping
+    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", alias_file)
+    triage_module._entity_aliases.cache_clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert triage_module._entity_aliases() == {}
+        assert any("not a flat string" in r.message for r in caplog.records)
+    finally:
+        triage_module._entity_aliases.cache_clear()

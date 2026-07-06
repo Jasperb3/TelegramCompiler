@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ import yaml
 
 from tg_compiler.config import TriageConfig
 from tg_compiler.db import PostRecord, AnalysisRecord
+
+log = logging.getLogger(__name__)
 
 _NON_WORD = re.compile(r'[^\w\s]')
 
@@ -24,10 +27,18 @@ _ENTITY_ALIASES_PATH = Path("entity_aliases.yaml")
 
 @lru_cache(maxsize=1)
 def _entity_aliases() -> dict[str, str]:
-    if _ENTITY_ALIASES_PATH.exists():
-        with open(_ENTITY_ALIASES_PATH) as f:
-            return yaml.safe_load(f) or {}
-    return {}
+    if not _ENTITY_ALIASES_PATH.exists():
+        log.info("No entity_aliases.yaml found at %s — alias normalisation disabled", _ENTITY_ALIASES_PATH.resolve())
+        return {}
+    with open(_ENTITY_ALIASES_PATH) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
+    ):
+        log.warning("entity_aliases.yaml at %s is not a flat string→string mapping — ignoring it", _ENTITY_ALIASES_PATH.resolve())
+        return {}
+    log.info("Loaded %d entity aliases from %s", len(data), _ENTITY_ALIASES_PATH.resolve())
+    return data
 
 
 def _normalize_entity(e: str) -> str:
