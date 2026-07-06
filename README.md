@@ -51,7 +51,7 @@ python --version   # must be 3.11 or newer
 Download from [https://lmstudio.ai](https://lmstudio.ai) and install it. You need a Vision-Language Model (VLM) loaded — one that can analyse images alongside text.
 
 Recommended model (small and capable):
-- `google/gemma-4-12b` — default model, excellent intelligence and vision capabilities
+- `google/gemma-4-12b-qat` — default model, excellent intelligence and vision capabilities
 - Alternatively you can try a larger GGUF model with vision support
 
 To start the server inside LM Studio: **Local Server → Start Server** (default port 1234).
@@ -153,6 +153,10 @@ triage:
 generation:
   output_dir: "./briefings"   # where PDFs and markdown are saved
   generate_at: "23:59"        # daily auto-generation time in daemon mode (HH:MM, in timezone below)
+  # WARNING: the briefing date is always the UTC calendar date, regardless of
+  # this timezone. Choose a generate_at whose UTC equivalent is late in the day
+  # being reported — a local time that converts to just after UTC midnight
+  # compiles the *new* (near-empty) UTC day instead of the day you meant.
   timezone: "UTC"             # IANA timezone for generate_at (e.g. "Europe/London")
   pdf_layout: "desktop"       # PDF CSS layout: "desktop" or "mobile" (override with --layout)
   # share_to_directory: "/path/to/shared/folder"  # if set, copy the final PDF here after generation
@@ -182,7 +186,7 @@ LM_API_TOKEN=your_api_token_here # required if LM Studio has authentication enab
 
 `TG_API_ID` and `TG_API_HASH` override the corresponding YAML fields. `LM_API_TOKEN` is only needed if you have enabled API token authentication in LM Studio's settings.
 
-If LM Studio is on a different machine, set `server_host` in `config.yaml` to its IP address (e.g. `192.168.1.96`).
+If LM Studio is on a different machine, set `server_host` in `config.yaml` to its IP address (e.g. `192.168.1.96`). Note that the connection is plain HTTP — the API token and post content traverse the LAN unencrypted, so only do this on a trusted network.
 
 ---
 
@@ -346,6 +350,8 @@ python -m tg_compiler.main --analyse --since 2026-06-07
 
 `--analyse` finds the most recent `TheDailyTelegram_*.pdf` in the date subdirectory, re-runs triage to reconstruct the same main-item set as the briefing (recency decay is anchored to that day, so past dates rank identically), synthesises via LM Studio, and prepends the front page. Re-running it replaces the existing front page rather than stacking a second one. Under `--batch` this runs automatically, so `--analyse` is mainly useful after a standalone `--generate`.
 
+> **Note:** `--generate` always builds today's (UTC) briefing — it does not accept `--since` and cannot rebuild a past day's PDF from scratch. `--analyse --since <date>` only prepends the intelligence front page to a PDF that already exists for that date; it does not regenerate the briefing itself.
+
 ### Mobile layout — `--layout`
 
 By default the PDF uses the desktop CSS layout. Pass `--layout mobile` (with `--batch`, `--generate`, or `--daemon`) to use a layout with larger text, tighter margins, and a single-column appendix, optimised for reading on a phone:
@@ -441,7 +447,7 @@ LM Studio server is not running, or `server_host`/`server_port` in `config.yaml`
 Your Telegram account is not a member of that channel. Join it in the Telegram app and retry.
 
 **"FloodWaitError: X seconds"**  
-Telegram rate-limited the request. The scraper will pause automatically and resume. If it happens often, increase `rate_limit_delay_ms`.
+Telegram rate-limited the request. Waits of 600 seconds or less are handled automatically — the scraper pauses and resumes on its own. Longer waits abort that channel's scrape with partial results saved; it will pick up where it left off on the next `--batch` run. If it happens often, increase `rate_limit_delay_ms`.
 
 **"ValidationError: extra inputs are not permitted"**  
 A field in `config.yaml` is misspelled or unknown. Check the field name against `config.yaml.example`.

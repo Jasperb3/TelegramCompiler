@@ -829,3 +829,47 @@ async def test_run_daemon_skips_llm_call_after_recent_connection_failure(tmp_pat
     db.init_schema()
     unanalysed = db.get_unanalysed_posts()
     assert {p.message_id for p in unanalysed} == {1, 2}
+
+
+async def test_scheduler_warns_when_generate_at_converts_to_near_midnight_utc(daemon_config, monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    daemon_config.generation.generate_at = "01:30"
+    daemon_config.generation.timezone = "Europe/London"  # BST in summer -> 00:30 UTC
+
+    class _StopLoop(Exception):
+        pass
+
+    async def fake_sleep(seconds):
+        raise _StopLoop
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(_StopLoop):
+            await main_module.schedule_daily_generation(daemon_config)
+
+    assert any("converts to" in r.message for r in caplog.records)
+
+
+async def test_scheduler_no_warning_for_safe_generate_at(daemon_config, monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    daemon_config.generation.generate_at = "23:59"
+    daemon_config.generation.timezone = "UTC"
+
+    class _StopLoop(Exception):
+        pass
+
+    async def fake_sleep(seconds):
+        raise _StopLoop
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(_StopLoop):
+            await main_module.schedule_daily_generation(daemon_config)
+
+    assert not any("converts to" in r.message for r in caplog.records)

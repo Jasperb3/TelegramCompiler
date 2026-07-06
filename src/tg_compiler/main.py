@@ -147,11 +147,23 @@ async def _run_daily_generation(config: AppConfig) -> None:
 async def schedule_daily_generation(config: AppConfig) -> None:
     import zoneinfo
     h, m = map(int, config.generation.generate_at.split(":"))
+    # generate_at/timezone are validated at config load; this fallback is now
+    # defensive only.
     try:
         tz = zoneinfo.ZoneInfo(config.generation.timezone)
     except Exception:
         log.warning("Unknown timezone %r — falling back to UTC", config.generation.timezone)
         tz = zoneinfo.ZoneInfo("UTC")
+
+    utc_hour = datetime.now(tz).replace(hour=h, minute=m).astimezone(timezone.utc).hour
+    if utc_hour < 3:
+        log.warning(
+            "generate_at %s (%s) converts to %02d:00 UTC — the briefing date is always "
+            "the UTC calendar date, so this may generate a near-empty briefing for the "
+            "new UTC day instead of the day you meant. See README's Daemon mode section.",
+            config.generation.generate_at, tz.key, utc_hour,
+        )
+
     while True:
         now = datetime.now(tz)
         target = now.replace(hour=h, minute=m, second=0, microsecond=0)
