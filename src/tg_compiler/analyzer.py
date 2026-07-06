@@ -178,6 +178,17 @@ def build_messages(post: PostRecord, system_prompt: str) -> list[dict]:
 
 
 _NUM_RE = re.compile(r'\b(\d+(?:\.\d+)?)\b')
+_TIME_TOKEN_RE = re.compile(r'\b\d{1,2}:\d{2}\b')  # e.g. "14:30"
+_YEAR_TOKEN_RE = re.compile(r'\b(?:19|20)\d{2}\b')  # e.g. "2026"
+
+
+def _strip_non_quantity_numbers(text: str) -> str:
+    """Remove time-of-day and year tokens before numeric comparison — they
+    collide with casualty/quantity figures of similar magnitude (e.g. "14:30"
+    vs "30 dead") and are not the kind of number the consistency check is for."""
+    text = _TIME_TOKEN_RE.sub(" ", text)
+    text = _YEAR_TOKEN_RE.sub(" ", text)
+    return text
 
 
 def _check_numeric_consistency(summary: str, image_desc: str) -> bool:
@@ -189,6 +200,8 @@ def _check_numeric_consistency(summary: str, image_desc: str) -> bool:
     """
     if not summary or not image_desc:
         return True
+    summary = _strip_non_quantity_numbers(summary)
+    image_desc = _strip_non_quantity_numbers(image_desc)
     s_nums = [float(x) for x in _NUM_RE.findall(summary) if float(x) > 0]
     i_nums = [float(x) for x in _NUM_RE.findall(image_desc) if float(x) > 0]
     if not s_nums or not i_nums:
@@ -219,6 +232,10 @@ def _sanitize(analysis: PostAnalysis) -> PostAnalysis:
     if analysis.image_description and not _check_numeric_consistency(
         analysis.summary, analysis.image_description
     ):
+        log.info(
+            "Image description dropped for post %r: numeric mismatch with summary",
+            analysis.title or analysis.summary[:60],
+        )
         analysis.image_description = None
 
     analysis.title = escape_html(analysis.title)

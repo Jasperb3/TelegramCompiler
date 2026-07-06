@@ -97,6 +97,21 @@ def test_numeric_consistency_different_magnitude_not_compared():
     assert _check_numeric_consistency("7.8 magnitude earthquake struck the region", "Around 1000 people visible in the image") is True
 
 
+def test_numeric_consistency_ignores_time_of_day_tokens():
+    # "14:30" (time) vs "30 dead" (casualty count) previously collided as 14 vs 30.
+    assert _check_numeric_consistency("Strike at 14:30 near Kharkiv", "Image shows 30 vehicles destroyed") is True
+
+
+def test_numeric_consistency_ignores_year_tokens():
+    # 203 (casualty count) vs 2026 (year) has ratio just under 10x, so without
+    # stripping the year token this would be wrongly flagged as a contradiction.
+    assert _check_numeric_consistency("Official toll of 203 confirmed dead", "Photo taken in 2026 shows the aftermath") is True
+
+
+def test_numeric_consistency_genuine_contradiction_still_detected():
+    assert _check_numeric_consistency("Officials say 12 killed in the blast", "Image caption reads 45 killed") is False
+
+
 def test_build_messages_truncates_long_text(sample_post):
     sample_post.text = "x" * 5000
     sample_post.media_paths = []
