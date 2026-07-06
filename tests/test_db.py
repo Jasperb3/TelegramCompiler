@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from tg_compiler.db import AnalysisRecord, PostRecord
+from tg_compiler.db import AnalysisRecord, Database, PostRecord
 
 
 def test_insert_and_fetch_post(db, sample_post):
@@ -95,3 +95,87 @@ def test_get_posts_with_analyses_in_range(db):
 
     results = db.get_posts_with_analyses_in_range("2026-06-06", "2026-06-08")
     assert [p.message_id for p, _ in results] == [2]
+
+
+def test_wal_and_busy_timeout_enabled_for_file_db(tmp_path):
+    db_path = tmp_path / "test.db"
+    database = Database(str(db_path))
+    database.init_schema()
+    journal_mode = database._conn.execute("PRAGMA journal_mode").fetchone()[0]
+    busy_timeout = database._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert journal_mode == "wal"
+    assert busy_timeout == 10000
+    database.close()
+
+
+def test_busy_timeout_enabled_for_memory_db(db):
+    busy_timeout = db._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert busy_timeout == 10000
+
+
+def test_insert_analysis_enforces_one_per_post(db, sample_post):
+    post_id = db.insert_post(sample_post)
+    first_id = db.insert_analysis(_record(post_id))
+    assert first_id is not None
+    second_id = db.insert_analysis(_record(post_id))
+    assert second_id is None
+    results = db.get_days_posts_with_analyses("2026-06-07")
+    assert len(results) == 1
+
+
+def test_init_schema_dedupes_pre_existing_duplicate_analyses(tmp_path):
+    db_path = tmp_path / "dupe.db"
+    database = Database(str(db_path))
+    # Build the schema without the unique index to simulate a pre-existing DB.
+    database._conn.executescript("""
+        CREATE TABLE posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id BIGINT NOT NULL,
+            channel_name TEXT,
+            message_id BIGINT NOT NULL,
+            timestamp DATETIME NOT NULL,
+            text TEXT,
+            media_paths TEXT,
+            has_images BOOLEAN,
+            has_video BOOLEAN DEFAULT 0,
+            raw_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(channel_id, message_id)
+        );
+        CREATE TABLE analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER REFERENCES posts(id),
+            title TEXT,
+            summary TEXT NOT NULL,
+            importance_score INTEGER,
+            urgency_score INTEGER,
+            credibility_score INTEGER,
+            relevance_score INTEGER,
+            category TEXT,
+            key_entities TEXT,
+            image_insights TEXT,
+            model_used TEXT,
+            threat_level TEXT DEFAULT 'MODERATE',
+            processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    database._conn.execute(
+        """INSERT INTO posts (channel_id, channel_name, message_id, timestamp, text,
+           media_paths, has_images, has_video, raw_json)
+           VALUES (100, 'test_chan', 1, '2026-06-07T12:00:00+00:00', 'x', '[]', 0, 0, '{}')"""
+    )
+    post_id = database._conn.execute("SELECT id FROM posts").fetchone()[0]
+    for summary in ("first", "second"):
+        database._conn.execute(
+            """INSERT INTO analyses (post_id, summary, category, key_entities, model_used)
+               VALUES (?, ?, 'Analysis', '[]', 'test-model')""",
+            (post_id, summary),
+        )
+    database._conn.commit()
+
+    database.init_schema()
+
+    rows = database._conn.execute("SELECT summary FROM analyses WHERE post_id=?", (post_id,)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["summary"] == "first"
+    database.close()

@@ -43,7 +43,9 @@ class Database:
         self._conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA busy_timeout = 10000")
         if db_path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode = WAL")
             secure_file(db_path)
 
     def close(self) -> None:
@@ -99,6 +101,15 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_analyses_post_id ON analyses(post_id);
             CREATE INDEX IF NOT EXISTS idx_posts_timestamp ON posts(timestamp);
         """)
+        self._conn.commit()
+        # Existing DBs may already have duplicate analyses per post from
+        # overlapping batch/daemon runs before the UNIQUE index existed.
+        self._conn.execute(
+            "DELETE FROM analyses WHERE id NOT IN (SELECT MIN(id) FROM analyses GROUP BY post_id)"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_analyses_post_unique ON analyses(post_id)"
+        )
         self._conn.commit()
         existing = {
             row[1]
@@ -172,9 +183,9 @@ class Database:
         ).fetchall()
         return [_row_to_post(r) for r in rows]
 
-    def insert_analysis(self, rec: AnalysisRecord) -> int:
+    def insert_analysis(self, rec: AnalysisRecord) -> int | None:
         cur = self._conn.execute(
-            """INSERT INTO analyses
+            """INSERT OR IGNORE INTO analyses
                (post_id, title, summary, importance_score, urgency_score, credibility_score,
                 relevance_score, category, key_entities, image_insights, model_used, threat_level)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -183,7 +194,7 @@ class Database:
              json.dumps(rec.key_entities), rec.image_insights, rec.model_used, rec.threat_level),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.lastrowid if cur.rowcount else None
 
     def get_days_posts_with_analyses(self, date_str: str) -> list[tuple[PostRecord, AnalysisRecord]]:
         rows = self._conn.execute(
