@@ -52,6 +52,8 @@ triage:
 generation:
   output_dir: "./briefings"         # where PDFs and markdown are saved
   generate_at: "23:59"              # daily auto-generation time in daemon mode (HH:MM, in the timezone below)
+  # NOTE: the briefing date is always the UTC calendar date. Pick a generate_at
+  # whose UTC equivalent is late in the day being reported, not just after UTC midnight.
   timezone: "UTC"                   # IANA timezone for generate_at scheduling (e.g. "Europe/London", "America/New_York")
   pdf_layout: "desktop"             # PDF CSS layout: "desktop" or "mobile" (override with --layout)
   # share_to_directory: "/path/to/shared/folder"  # if set, copy the final PDF here after generation
