@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from tg_compiler.utils import secure_file
 
@@ -40,7 +40,7 @@ class AnalysisRecord:
 
 class Database:
     def __init__(self, db_path: str):
-        self._conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA busy_timeout = 10000")
@@ -131,7 +131,7 @@ class Database:
             self._conn.execute("ALTER TABLE posts ADD COLUMN has_video BOOLEAN DEFAULT 0")
             self._conn.commit()
 
-    def insert_post(self, post: PostRecord) -> int | None:
+    def insert_post(self, post: PostRecord, commit: bool = True) -> int | None:
         try:
             cur = self._conn.execute(
                 """INSERT INTO posts
@@ -142,12 +142,16 @@ class Database:
                  post.timestamp.isoformat(), post.text,
                  json.dumps(post.media_paths), post.has_images, post.has_video, post.raw_json),
             )
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
             return cur.lastrowid
         except sqlite3.IntegrityError as e:
             if "UNIQUE" not in str(e):
                 raise
             return None
+
+    def commit(self) -> None:
+        self._conn.commit()
 
     def get_post(self, post_id: int) -> PostRecord:
         row = self._conn.execute(
@@ -199,26 +203,32 @@ class Database:
         return cur.lastrowid if cur.rowcount else None
 
     def get_days_posts_with_analyses(self, date_str: str) -> list[tuple[PostRecord, AnalysisRecord]]:
+        start = date_str
+        end = (date.fromisoformat(date_str) + timedelta(days=1)).isoformat()
+        # Timestamps are uniform ISO-8601 UTC strings, so lexicographic
+        # comparison against date bounds is exact and index-friendly.
         rows = self._conn.execute(
             """SELECT p.*, a.id as a_id, a.title, a.summary, a.importance_score, a.urgency_score,
                       a.credibility_score, a.relevance_score, a.category,
                       a.key_entities, a.image_insights, a.model_used, a.threat_level
                FROM posts p
                JOIN analyses a ON a.post_id = p.id
-               WHERE DATE(p.timestamp) = ?""",
-            (date_str,),
+               WHERE p.timestamp >= ? AND p.timestamp < ?""",
+            (start, end),
         ).fetchall()
         return _rows_to_pairs(rows)
 
     def get_posts_with_analyses_in_range(self, start_date_str: str, end_date_str: str) -> list[tuple[PostRecord, AnalysisRecord]]:
+        start = start_date_str
+        end = (date.fromisoformat(end_date_str) + timedelta(days=1)).isoformat()
         rows = self._conn.execute(
             """SELECT p.*, a.id as a_id, a.title, a.summary, a.importance_score, a.urgency_score,
                       a.credibility_score, a.relevance_score, a.category,
                       a.key_entities, a.image_insights, a.model_used, a.threat_level
                FROM posts p
                JOIN analyses a ON a.post_id = p.id
-               WHERE DATE(p.timestamp) BETWEEN ? AND ?""",
-            (start_date_str, end_date_str),
+               WHERE p.timestamp >= ? AND p.timestamp < ?""",
+            (start, end),
         ).fetchall()
         return _rows_to_pairs(rows)
 

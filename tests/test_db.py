@@ -120,6 +120,29 @@ def test_get_posts_with_analyses_in_range(db):
     assert [p.message_id for p, _ in results] == [2]
 
 
+def test_get_days_posts_with_analyses_boundary(db):
+    end_of_day = PostRecord(
+        channel_id=100, channel_name="test_chan", message_id=1,
+        timestamp=datetime(2026, 6, 7, 23, 59, 59, tzinfo=timezone.utc),
+        text="x", media_paths=[], has_images=False, raw_json="{}",
+    )
+    start_of_next_day = PostRecord(
+        channel_id=100, channel_name="test_chan", message_id=2,
+        timestamp=datetime(2026, 6, 8, 0, 0, 0, tzinfo=timezone.utc),
+        text="x", media_paths=[], has_images=False, raw_json="{}",
+    )
+    post_id_1 = db.insert_post(end_of_day)
+    post_id_2 = db.insert_post(start_of_next_day)
+    db.insert_analysis(_record(post_id_1))
+    db.insert_analysis(_record(post_id_2))
+
+    day_results = db.get_days_posts_with_analyses("2026-06-07")
+    assert [p.message_id for p, _ in day_results] == [1]
+
+    next_day_results = db.get_days_posts_with_analyses("2026-06-08")
+    assert [p.message_id for p, _ in next_day_results] == [2]
+
+
 def test_wal_and_busy_timeout_enabled_for_file_db(tmp_path):
     db_path = tmp_path / "test.db"
     database = Database(str(db_path))

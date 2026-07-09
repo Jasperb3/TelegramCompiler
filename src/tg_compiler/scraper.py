@@ -118,7 +118,7 @@ class Scraper:
                     has_video=has_video,
                     raw_json=json.dumps({"id": msg.id, "text": text}),
                 )
-                post_id = self._db.insert_post(record)
+                post_id = self._db.insert_post(record, commit=False)
                 if post_id is not None:
                     record.id = post_id
                     collected.append(record)
@@ -136,5 +136,9 @@ class Scraper:
         finally:
             if "max_id_seen" in locals() and max_id_seen > last_seen:
                 self._db.set_last_seen_id(channel_id, max_id_seen)
+            elif "channel_id" in locals():
+                # set_last_seen_id above also commits pending post inserts on the
+                # same connection; when the cursor didn't move, commit explicitly.
+                self._db.commit()
 
         return collected

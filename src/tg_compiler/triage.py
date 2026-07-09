@@ -59,6 +59,9 @@ class TriagedPost:
     analysis: AnalysisRecord
     composite_score: float
     corroborations: list[CorroborationRef] = field(default_factory=list)
+    # Precomputed normalized entity set, filled in by triage() before dedup so
+    # _find_duplicate doesn't re-normalize the same post's entities on every comparison.
+    norm_entities: frozenset[str] | None = None
 
 
 @dataclass
@@ -130,8 +133,8 @@ def _find_duplicate(
         if delta > time_window_secs:
             continue
         # Entity overlap: ≥entity_overlap_count shared named entities within time window
-        cand_entities = {_normalize_entity(e) for e in candidate.analysis.key_entities}
-        exist_entities = {_normalize_entity(e) for e in existing.analysis.key_entities}
+        cand_entities = candidate.norm_entities
+        exist_entities = existing.norm_entities
         if len(cand_entities) >= entity_overlap_count and len(exist_entities) >= entity_overlap_count:
             if len(cand_entities & exist_entities) >= entity_overlap_count:
                 return existing
@@ -144,8 +147,8 @@ def _find_duplicate(
         )
         if delta > entity_cluster_window_secs:
             continue
-        cand_entities = {_normalize_entity(e) for e in candidate.analysis.key_entities}
-        exist_entities = {_normalize_entity(e) for e in existing.analysis.key_entities}
+        cand_entities = candidate.norm_entities
+        exist_entities = existing.norm_entities
         if len(cand_entities) >= entity_cluster_overlap_count and len(exist_entities) >= entity_cluster_overlap_count:
             if len(cand_entities & exist_entities) >= entity_cluster_overlap_count:
                 return existing
@@ -198,7 +201,8 @@ def triage(
             score *= config.rumor_penalty
         score *= config.threat_multipliers.get(analysis.threat_level, 1.0)
         score *= _recency_multiplier(post.timestamp, now, config.recency_half_life_hours, config.recency_floor)
-        scored.append(TriagedPost(post=post, analysis=analysis, composite_score=score))
+        norm_entities = frozenset(_normalize_entity(e) for e in analysis.key_entities)
+        scored.append(TriagedPost(post=post, analysis=analysis, composite_score=score, norm_entities=norm_entities))
 
     scored.sort(key=lambda t: (
         -t.composite_score,

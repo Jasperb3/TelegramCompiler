@@ -293,6 +293,53 @@ def test_dedup_24h_entity_cluster_not_triggered_with_only_3_entities():
     assert total == 2
 
 
+def test_dedup_cross_pass_ordering_prefers_summary_pass_over_earlier_cluster_match():
+    # Regression test pinning _find_duplicate's two-pass semantics: pass 1 (summary/
+    # entity-overlap window) is fully scanned over `kept` before pass 2 (entity-cluster
+    # window) ever runs. So a *later* kept item that matches on pass 1 wins over an
+    # *earlier* kept item that would only have matched on pass 2 — even though the
+    # earlier item is closer in time. If the two passes were ever merged into one
+    # loop-per-existing-item, the earlier item (X) would win instead; this test would
+    # then need updating rather than silently reporting a different representative.
+    base_ts = datetime(2026, 6, 7, 12, 0, tzinfo=timezone.utc)
+    # X: kept first (highest score); only qualifies for a match via the entity-cluster
+    # pass (4h gap, 4+ shared entities) — its summary is unrelated to the candidate's.
+    x_post, x_analysis = make_pair(
+        importance=5, msg_id=1,
+        summary="Agriculture ministry announces new crop subsidy reforms",
+        timestamp=base_ts,
+    )
+    x_analysis.key_entities = ["Israel", "Iran", "IRGC", "Tel Aviv", "drone"]
+    # Y: kept second; matches the candidate via the summary/jaccard pass 1 rule.
+    y_post, y_analysis = make_pair(
+        importance=4, msg_id=2,
+        summary="Israeli airstrikes hit Dahiyeh suburb of Beirut Lebanon",
+        timestamp=base_ts + timedelta(minutes=20),
+    )
+    # Candidate: shares 4 entities with X (4h gap) and near-identical summary with Y.
+    c_post, c_analysis = make_pair(
+        importance=1, msg_id=3,
+        summary="Israeli airstrikes reported in Dahiyeh suburb Beirut",
+        timestamp=base_ts + timedelta(hours=4),
+    )
+    c_analysis.key_entities = ["Israel", "Iran", "IRGC", "Tel Aviv", "strikes"]
+
+    config = TriageConfig(
+        min_composite_score=0.0,
+        dedup_window_secs=3600,              # 1h: entity-overlap pass window
+        dedup_summary_window_secs=21600,     # 6h: summary/jaccard pass window
+        entity_cluster_window_secs=86400,    # 24h: entity-cluster pass window
+    )
+    result = triage([(x_post, x_analysis), (y_post, y_analysis), (c_post, c_analysis)], config)
+    kept = result.main_items + result.appendix_items
+    assert len(kept) == 2
+
+    y_item = next(t for t in kept if t.post.message_id == 2)
+    assert any(c.message_id == 3 for c in y_item.corroborations)
+    x_item = next(t for t in kept if t.post.message_id == 1)
+    assert x_item.corroborations == []
+
+
 def test_skipped_category_excluded_from_main_and_appendix():
     post, analysis = make_pair(category="Skipped", summary="", importance=None, urgency=None,
                                 credibility=None, relevance=None)

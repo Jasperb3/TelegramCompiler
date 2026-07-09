@@ -175,6 +175,82 @@ async def test_permanent_media_download_failure_keeps_has_images_and_cleans_part
     assert not Path(dest).exists()
 
 
+async def test_scrape_channel_commits_posts_visible_to_other_connection(scraper_config, monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+    from telethon.tl.types import Message, PeerChannel
+    from tg_compiler.db import Database
+
+    db_path = tmp_path / "scrape.db"
+    db = Database(str(db_path))
+    db.init_schema()
+    channel_cfg = scraper_config.telegram.channels[0]
+    scraper = Scraper(scraper_config, db)
+
+    async def fake_get_entity(_):
+        return PeerChannel(12345)
+
+    def fake_iter_messages(_, **kwargs):
+        async def _gen():
+            yield Message(
+                id=7,
+                peer_id=PeerChannel(12345),
+                date=datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc),
+                message="hello",
+            )
+        return _gen()
+
+    monkeypatch.setattr(scraper._client, "get_entity", fake_get_entity)
+    monkeypatch.setattr(scraper._client, "iter_messages", fake_iter_messages)
+
+    await scraper.scrape_channel(channel_cfg)
+    db.close()
+
+    other_conn = Database(str(db_path))
+    rows = other_conn._conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+    other_conn.close()
+    assert rows == 1
+
+
+async def test_scrape_channel_commits_prior_posts_on_mid_iteration_exception(
+    scraper_config, monkeypatch, tmp_path
+):
+    from datetime import datetime, timezone
+    from telethon.tl.types import Message, PeerChannel
+    from tg_compiler.db import Database
+
+    db_path = tmp_path / "scrape_partial.db"
+    db = Database(str(db_path))
+    db.init_schema()
+    channel_cfg = scraper_config.telegram.channels[0]
+    scraper = Scraper(scraper_config, db)
+
+    async def fake_get_entity(_):
+        return PeerChannel(12345)
+
+    def fake_iter_messages(_, **kwargs):
+        async def _gen():
+            yield Message(
+                id=7,
+                peer_id=PeerChannel(12345),
+                date=datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc),
+                message="first message",
+            )
+            raise ConnectionError("simulated mid-iteration failure")
+
+        return _gen()
+
+    monkeypatch.setattr(scraper._client, "get_entity", fake_get_entity)
+    monkeypatch.setattr(scraper._client, "iter_messages", fake_iter_messages)
+
+    await scraper.scrape_channel(channel_cfg)
+    db.close()
+
+    other_conn = Database(str(db_path))
+    rows = other_conn._conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+    other_conn.close()
+    assert rows == 1
+
+
 async def test_daemon_and_batch_inserts_collide_on_unique(db):
     """A message scraped by batch (now marked id) and the same message from the
     daemon (event.chat_id, marked id) must be the same row, not two."""
