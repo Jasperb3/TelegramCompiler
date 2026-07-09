@@ -93,8 +93,11 @@ from tg_compiler.main import purge_old_media
 
 
 def test_purge_removes_old_directories(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    today = datetime.now(timezone.utc).date()
     old_dir = tmp_path / "news" / "2020-01-01"
-    recent_dir = tmp_path / "news" / "2026-06-07"
+    recent_dir = tmp_path / "news" / (today - timedelta(days=5)).isoformat()
     old_dir.mkdir(parents=True)
     recent_dir.mkdir(parents=True)
     (old_dir / "1.jpg").write_bytes(b"x")
