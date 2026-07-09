@@ -1,16 +1,14 @@
 from __future__ import annotations
+
 import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
-from functools import lru_cache
-from pathlib import Path
-
-import yaml
 
 from tg_compiler.config import TriageConfig
-from tg_compiler.db import PostRecord, AnalysisRecord
+from tg_compiler.db import AnalysisRecord, PostRecord
+from tg_compiler.utils import normalize_entity
 
 log = logging.getLogger(__name__)
 
@@ -18,32 +16,9 @@ _NON_WORD = re.compile(r'[^\w\s]')
 
 _SEVERITY_RANK: dict[str, int] = {"CRITICAL": 4, "HIGH": 3, "MODERATE": 2, "LOW": 1}
 
-# Aliases for entity-overlap dedup so naming variants of the same actor match
-# (e.g. "U.S." and "United States" both normalize to "united states"). Keys are
-# compared with periods stripped. Defined entirely via entity_aliases.yaml
-# (gitignored, project root) — see entity_aliases.yaml.example. Empty if absent.
-_ENTITY_ALIASES_PATH = Path("entity_aliases.yaml")
-
-
-@lru_cache(maxsize=1)
-def _entity_aliases() -> dict[str, str]:
-    if not _ENTITY_ALIASES_PATH.exists():
-        log.info("No entity_aliases.yaml found at %s — alias normalisation disabled", _ENTITY_ALIASES_PATH.resolve())
-        return {}
-    with open(_ENTITY_ALIASES_PATH) as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict) or not all(
-        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
-    ):
-        log.warning("entity_aliases.yaml at %s is not a flat string→string mapping — ignoring it", _ENTITY_ALIASES_PATH.resolve())
-        return {}
-    log.info("Loaded %d entity aliases from %s", len(data), _ENTITY_ALIASES_PATH.resolve())
-    return data
-
-
-def _normalize_entity(e: str) -> str:
-    stripped = e.strip().lower().replace(".", "")
-    return _entity_aliases().get(stripped, stripped)
+# Guaranteed size of the Lead Reports section before criticals-overflow, topped
+# up with the highest-scoring non-critical main items (see triage()).
+LEAD_SECTION_SIZE = 10
 
 
 @dataclass
@@ -163,6 +138,10 @@ def triage(
     channel_priorities: dict[str, float] | None = None,
     channel_credibilities: dict[str, float] | None = None,
 ) -> BriefingContent:
+    """Score, badge-guard, dedup-cluster, and split (pairs of post, analysis) into a
+    BriefingContent's main/appendix/executive item lists. Mutates analysis.threat_level
+    in place when the badge guard demotes an unsubstantiated CRITICAL to HIGH — this is
+    by design, so an already-stored analysis is corrected the next time it's triaged."""
     today = today or date.today()
     # Anchor recency decay to the end of the briefing day when triaging a past date,
     # so retrospective runs (--analyse --since) reproduce the same ranking the daemon
@@ -196,12 +175,14 @@ def triage(
             if kw.lower() in text_lower:
                 score = min(5.0, score + config.keyword_boost)
                 break
+        # Second cap: priority/credibility multipliers above 1.0 can push an
+        # un-boosted score over 5.0 too, not just the keyword-boost branch above.
         score = min(5.0, score)
         if analysis.category == "Rumor":
             score *= config.rumor_penalty
         score *= config.threat_multipliers.get(analysis.threat_level, 1.0)
         score *= _recency_multiplier(post.timestamp, now, config.recency_half_life_hours, config.recency_floor)
-        norm_entities = frozenset(_normalize_entity(e) for e in analysis.key_entities)
+        norm_entities = frozenset(normalize_entity(e) for e in analysis.key_entities)
         scored.append(TriagedPost(post=post, analysis=analysis, composite_score=score, norm_entities=norm_entities))
 
     scored.sort(key=lambda t: (
@@ -278,7 +259,7 @@ def triage(
     # section grows beyond 10 when criticals alone exceed it.
     critical_items = [t for t in all_kept if t.analysis.threat_level == "CRITICAL"]
     other_items = [t for t in main_items if t.analysis.threat_level != "CRITICAL"]
-    executive_items = critical_items + other_items[: max(0, 10 - len(critical_items))]
+    executive_items = critical_items + other_items[: max(0, LEAD_SECTION_SIZE - len(critical_items))]
 
     return BriefingContent(
         date=today,

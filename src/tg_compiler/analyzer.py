@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import asyncio
 import base64
 import logging
@@ -10,8 +11,8 @@ from openai import OpenAI
 from pydantic import BaseModel, Field, field_validator
 
 from tg_compiler.config import AppConfig, ChannelConfig
-from tg_compiler.db import Database, PostRecord, AnalysisRecord
-from tg_compiler.utils import clean_entities, escape_html, _ENTITY_GARBAGE
+from tg_compiler.db import AnalysisRecord, Database, PostRecord
+from tg_compiler.utils import _ENTITY_GARBAGE, clean_entities, escape_html
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,11 @@ _VALID_THREAT_LEVELS = {"CRITICAL", "HIGH", "MODERATE", "LOW"}
 
 # Posts with less text than this and no media are skipped before analysis (B1).
 MIN_CONTENT_CHARS = 30
+MAX_PROMPT_TEXT_CHARS = 3000  # post text is truncated to this many chars before being sent to the LLM
+MAX_IMAGES_PER_POST = 3       # at most this many images are attached per post's analysis prompt
+ANALYSIS_MAX_ATTEMPTS = 3     # analyze_post's structured-output retry ladder
+RETRY_BACKOFF_BASE_SECS = 10  # backoff = RETRY_BACKOFF_BASE_SECS * (attempt + 1)
+PREFLIGHT_TIMEOUT_SECS = 10   # LM Studio reachability probe timeout before process_unanalysed runs
 
 
 class PostAnalysis(BaseModel):
@@ -159,11 +165,11 @@ def _encode_image(path: str) -> str | None:
 
 
 def build_messages(post: PostRecord, system_prompt: str) -> list[dict]:
-    text = post.text[:3000] if len(post.text) > 3000 else post.text
+    text = post.text[:MAX_PROMPT_TEXT_CHARS] if len(post.text) > MAX_PROMPT_TEXT_CHARS else post.text
     header = f"Post from {post.channel_name} at {post.timestamp.isoformat()}:\n\n{text}"
 
     content: list[dict] = [{"type": "text", "text": header}]
-    for path in post.media_paths[:3]:
+    for path in post.media_paths[:MAX_IMAGES_PER_POST]:
         b64 = _encode_image(path)
         if b64:
             content.append({
@@ -325,17 +331,17 @@ class Analyzer:
         )
         messages = build_messages(post, system)
 
-        for attempt in range(3):
+        for attempt in range(ANALYSIS_MAX_ATTEMPTS):
             try:
                 result = await asyncio.to_thread(self._call_llm, messages, True)
                 if isinstance(result, PostAnalysis):
                     return _sanitize(result)
                 return _sanitize(parse_analysis_fallback(result if isinstance(result, str) else ""))
             except Exception as e:
-                if attempt == 2:
+                if attempt == ANALYSIS_MAX_ATTEMPTS - 1:
                     log.warning(
-                        "Analysis failed for post %s after 3 attempts, trying plain-text fallback: %s",
-                        post.message_id, e,
+                        "Analysis failed for post %s after %d attempts, trying plain-text fallback: %s",
+                        post.message_id, ANALYSIS_MAX_ATTEMPTS, e,
                     )
                     # Last resort: plain-text call. If this also fails, propagate —
                     # writing a fabricated empty analysis would permanently mark the
@@ -344,12 +350,12 @@ class Analyzer:
                     if isinstance(result, PostAnalysis):
                         return _sanitize(result)
                     return _sanitize(parse_analysis_fallback(result if isinstance(result, str) else ""))
-                await asyncio.sleep(10 * (attempt + 1))
+                await asyncio.sleep(RETRY_BACKOFF_BASE_SECS * (attempt + 1))
 
     def _server_reachable(self) -> bool:
         """Quick preflight probe so a dead LM Studio aborts in seconds, not hours."""
         try:
-            self._get_client().with_options(timeout=10).models.list()
+            self._get_client().with_options(timeout=PREFLIGHT_TIMEOUT_SECS).models.list()
             return True
         except Exception as e:
             cfg = self._cfg.lmstudio
@@ -362,6 +368,11 @@ class Analyzer:
     async def process_unanalysed(
         self, channel_map: dict[int, ChannelConfig] | None = None
     ) -> tuple[int, int]:
+        """Analyse every unanalysed post up to lmstudio.max_concurrent_analyses in
+        parallel, after a preflight reachability probe (aborts with everything left
+        queued if LM Studio is down). Posts under MIN_CONTENT_CHARS with no media are
+        skipped (recorded with category="Skipped") rather than sent to the LLM.
+        Returns (analysed_count, skipped_count)."""
         posts = self._db.get_unanalysed_posts()
         if not posts:
             return 0, 0

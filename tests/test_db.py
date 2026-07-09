@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
+
 import pytest
+
 from tg_compiler.db import AnalysisRecord, Database, PostRecord
 
 

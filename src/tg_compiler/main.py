@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import argparse
 import asyncio
 import logging
@@ -7,18 +8,24 @@ import shutil
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from tg_compiler.config import load_config, AppConfig, ChannelConfig
-from tg_compiler.db import Database, PostRecord
+from tg_compiler.config import AppConfig, ChannelConfig, load_config
+from tg_compiler.db import Database
 from tg_compiler.scraper import Scraper
 from tg_compiler.utils import connect_telegram_client, secure_file
 
+if TYPE_CHECKING:
+    from tg_compiler.triage import BriefingContent
+
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+HEARTBEAT_INTERVAL_SECS = 3600  # daemon logs stored/analysed counts on this cadence
 
 
 def _share_pdf(config: AppConfig, pdf_path: Path) -> None:
@@ -39,21 +46,17 @@ async def generate_daily_briefing(
     posts_analysed: int = 0,
     posts_skipped: int = 0,
     layout: str | None = None,
-) -> tuple[str, "BriefingContent"]:
-    from tg_compiler.triage import triage as do_triage, BriefingContent
+) -> tuple[Path, "BriefingContent"]:
+    """Triage the day's analysed posts, render the PDF/markdown briefing off the
+    event loop, and return its path plus the BriefingContent used to render it."""
     from tg_compiler.generator import generate_briefing
+    from tg_compiler.triage import triage as do_triage
 
     pairs = db.get_days_posts_with_analyses(target_date.isoformat())
-    channel_priorities = {ch.slug: ch.priority for ch in config.telegram.channels}
-    channel_credibilities = {ch.slug: ch.credibility for ch in config.telegram.channels}
     content = do_triage(pairs, config.triage, today=target_date,
-                         channel_priorities=channel_priorities,
-                         channel_credibilities=channel_credibilities)
-    content.channel_links = {
-        ch.slug: ch.username.lstrip("@")
-        for ch in config.telegram.channels
-        if ch.username
-    }
+                         channel_priorities=config.channel_priority_map(),
+                         channel_credibilities=config.channel_credibility_map())
+    content.channel_links = config.channel_link_map()
     content.posts_scraped = posts_scraped
     content.posts_analysed = posts_analysed
     content.posts_skipped = posts_skipped
@@ -181,9 +184,11 @@ async def schedule_daily_generation(config: AppConfig) -> None:
 
 async def run_daemon(config: AppConfig) -> None:
     from openai import APIConnectionError
-    from telethon import TelegramClient, events, utils as telethon_utils
+    from telethon import TelegramClient, events
+    from telethon import utils as telethon_utils
+
     from tg_compiler.analyzer import Analyzer, analysis_to_record
-    from tg_compiler.scraper import media_path_for
+    from tg_compiler.scraper import build_post_record
 
     db = Database(config.storage.db_path)
     db.init_schema()
@@ -191,6 +196,8 @@ async def run_daemon(config: AppConfig) -> None:
     analysis_sem = asyncio.Semaphore(config.lmstudio.max_concurrent_analyses)
     last_probe_failure: float | None = None
     PROBE_BACKOFF_SECS = 60
+    stored_count = 0
+    analysed_count = 0
 
     client = TelegramClient(
         config.telegram.session_name,
@@ -219,48 +226,21 @@ async def run_daemon(config: AppConfig) -> None:
 
         @client.on(events.NewMessage(chats=channel_entities))
         async def handle_new_message(event):
-            nonlocal last_probe_failure
+            nonlocal last_probe_failure, stored_count, analysed_count
             msg = event.message
             channel_id = event.chat_id
             channel_cfg = channel_cfg_by_id.get(channel_id)
             if channel_cfg is None:
                 log.warning("Received message from unmapped channel %s — skipping", channel_id)
                 return
-            text = msg.text or ""
-            ts = msg.date
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-
-            media_paths: list[str] = []
-            has_video = bool(msg.video or msg.gif)
-            if msg.photo:
-                dest = media_path_for(
-                    config.storage.media_dir, channel_cfg.slug,
-                    ts.strftime("%Y-%m-%d"), msg.id, "jpg",
-                )
-                try:
-                    await client.download_media(msg, file=dest)
-                    media_paths.append(dest)
-                except Exception as e:
-                    log.warning("Daemon: media download failed for %s: %s", msg.id, e)
-
-            record = PostRecord(
-                channel_id=channel_id,
-                channel_name=channel_cfg.slug,
-                message_id=msg.id,
-                timestamp=ts,
-                text=text,
-                media_paths=media_paths,
-                has_images=bool(media_paths),
-                has_video=has_video,
-                raw_json="{}",
-            )
+            record = await build_post_record(client, msg, channel_id, channel_cfg, config.storage)
             post_id = db.insert_post(record)
             # Advance the per-channel cursor so a later --batch resumes from here
             # instead of re-walking everything the daemon already captured. Guard
             # with max() so out-of-order live events never rewind it.
             if msg.id > db.get_last_seen_id(channel_id):
                 db.set_last_seen_id(channel_id, msg.id)
+            analysed = False
             if post_id is not None:
                 record.id = post_id
                 if (
@@ -268,16 +248,21 @@ async def run_daemon(config: AppConfig) -> None:
                     and time.monotonic() - last_probe_failure < PROBE_BACKOFF_SECS
                 ):
                     log.debug("LM Studio recently unreachable — post %s left queued", msg.id)
-                    return
-                try:
-                    async with analysis_sem:
-                        analysis = await analyzer.analyze_post(record, channel_cfg)
-                    db.insert_analysis(analysis_to_record(post_id, analysis, config.lmstudio.model))
-                    last_probe_failure = None
-                except Exception as e:
-                    log.error("Analysis failed for post %s: %s", msg.id, e)
-                    if isinstance(e, APIConnectionError):
-                        last_probe_failure = time.monotonic()
+                else:
+                    try:
+                        async with analysis_sem:
+                            analysis = await analyzer.analyze_post(record, channel_cfg)
+                        db.insert_analysis(analysis_to_record(post_id, analysis, config.lmstudio.model))
+                        last_probe_failure = None
+                        analysed = True
+                    except Exception as e:
+                        log.error("Analysis failed for post %s: %s", msg.id, e)
+                        if isinstance(e, APIConnectionError):
+                            last_probe_failure = time.monotonic()
+            stored_count += 1
+            if analysed:
+                analysed_count += 1
+            log.debug("Stored post %s from %s%s", msg.id, channel_cfg.slug, " (analysed)" if analysed else "")
 
         scheduler_task = asyncio.create_task(schedule_daily_generation(config))
 
@@ -286,6 +271,24 @@ async def run_daemon(config: AppConfig) -> None:
                 log.error("Daily generation scheduler crashed", exc_info=task.exception())
 
         scheduler_task.add_done_callback(_on_scheduler_done)
+
+        async def _heartbeat() -> None:
+            nonlocal stored_count, analysed_count
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECS)
+                log.info("Daemon heartbeat: %d posts stored, %d analysed in the last hour",
+                          stored_count, analysed_count)
+                stored_count = 0
+                analysed_count = 0
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
+
+        def _on_heartbeat_done(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                log.error("Daemon heartbeat task crashed", exc_info=task.exception())
+
+        heartbeat_task.add_done_callback(_on_heartbeat_done)
+
         log.info("Daemon running on %d channels", len(channel_entities))
         await client.run_until_disconnected()
     finally:

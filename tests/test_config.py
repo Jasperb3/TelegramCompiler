@@ -1,6 +1,7 @@
 import pytest
 from pydantic import ValidationError
-from tg_compiler.config import AppConfig, load_config
+
+from tg_compiler.config import load_config
 
 MINIMAL_YAML = """
 telegram:

@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from tg_compiler.scraper import media_path_for
 
 
@@ -31,8 +32,9 @@ def test_different_channels_dont_collide(tmp_path):
 
 
 import pytest
+
+from tg_compiler.config import AppConfig, ChannelConfig, LMStudioConfig, TelegramConfig
 from tg_compiler.scraper import Scraper
-from tg_compiler.config import AppConfig, TelegramConfig, LMStudioConfig, ChannelConfig
 
 
 @pytest.fixture
@@ -89,6 +91,7 @@ async def test_scrape_channel_does_not_cap_iter_messages_limit(db, scraper_confi
 
 async def test_scrape_channel_uses_marked_peer_id_for_post_and_cursor(db, scraper_config, monkeypatch):
     from datetime import datetime, timezone
+
     from telethon import utils as telethon_utils
     from telethon.tl.types import Message, PeerChannel
 
@@ -128,10 +131,50 @@ async def test_scrape_channel_uses_marked_peer_id_for_post_and_cursor(db, scrape
     assert scraper.channel_map[marked_id] is channel_cfg
 
 
+async def test_build_post_record_stub_message(tmp_path):
+    from datetime import datetime, timezone
+
+    from telethon.tl.types import Message, PeerChannel
+
+    from tg_compiler.config import StorageConfig
+    from tg_compiler.scraper import build_post_record
+
+    class StubClient:
+        parse_mode = None
+
+        async def download_media(self, msg, file):
+            Path(file).parent.mkdir(parents=True, exist_ok=True)
+            Path(file).write_bytes(b"jpg-bytes")
+
+    channel_cfg = ChannelConfig(slug="test_chan", username="@test_chan")
+    storage_cfg = StorageConfig(media_dir=str(tmp_path / "media"))
+    msg = Message(
+        id=42,
+        peer_id=PeerChannel(999),
+        date=datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc),
+        message="hello world",
+    )
+    stub_client = StubClient()
+    msg._client = stub_client
+
+    record = await build_post_record(stub_client, msg, channel_id=-1000000000999,
+                                      channel_cfg=channel_cfg, storage_cfg=storage_cfg)
+
+    assert record.channel_id == -1000000000999
+    assert record.channel_name == "test_chan"
+    assert record.message_id == 42
+    assert record.text == "hello world"
+    assert record.media_paths == []
+    assert record.has_images is False
+    assert record.has_video is False
+    assert record.raw_json == '{"id": 42, "text": "hello world"}'
+
+
 async def test_permanent_media_download_failure_keeps_has_images_and_cleans_partial_file(
     db, scraper_config, monkeypatch, tmp_path
 ):
     from datetime import datetime, timezone
+
     from telethon.tl.types import Message, PeerChannel
 
     class FakeMessage(Message):
@@ -177,7 +220,9 @@ async def test_permanent_media_download_failure_keeps_has_images_and_cleans_part
 
 async def test_scrape_channel_commits_posts_visible_to_other_connection(scraper_config, monkeypatch, tmp_path):
     from datetime import datetime, timezone
+
     from telethon.tl.types import Message, PeerChannel
+
     from tg_compiler.db import Database
 
     db_path = tmp_path / "scrape.db"
@@ -215,7 +260,9 @@ async def test_scrape_channel_commits_prior_posts_on_mid_iteration_exception(
     scraper_config, monkeypatch, tmp_path
 ):
     from datetime import datetime, timezone
+
     from telethon.tl.types import Message, PeerChannel
+
     from tg_compiler.db import Database
 
     db_path = tmp_path / "scrape_partial.db"
@@ -255,6 +302,7 @@ async def test_daemon_and_batch_inserts_collide_on_unique(db):
     """A message scraped by batch (now marked id) and the same message from the
     daemon (event.chat_id, marked id) must be the same row, not two."""
     from datetime import datetime, timezone
+
     from tg_compiler.db import PostRecord
 
     marked_id = -1000000012345

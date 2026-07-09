@@ -1,7 +1,7 @@
 """Tests for synthesiser JSON validation and PDF merge."""
 import pytest
-from tg_compiler.synthesiser import _validate_intel, _prepend_pdf, _resolve_sources
 
+from tg_compiler.synthesiser import _prepend_pdf, _resolve_sources, _validate_intel
 
 # ---------------------------------------------------------------------------
 # _validate_intel
@@ -173,6 +173,7 @@ def test_format_previous_themes_includes_theme_text():
 
 def test_render_front_page_md_includes_sources_and_continuity():
     from datetime import date
+
     from tg_compiler.synthesiser import _render_front_page_md
 
     intel = _good_intel()
@@ -187,6 +188,7 @@ def test_render_front_page_md_includes_sources_and_continuity():
 
 def test_render_front_page_md_emerging_section_present_when_nonempty():
     from datetime import date
+
     from tg_compiler.synthesiser import _render_front_page_md
 
     md = _render_front_page_md(_good_intel(), date(2026, 6, 9), emerging_entities=["bahrain"])
@@ -197,6 +199,7 @@ def test_render_front_page_md_emerging_section_present_when_nonempty():
 
 def test_render_front_page_md_emerging_section_absent_when_empty():
     from datetime import date
+
     from tg_compiler.synthesiser import _render_front_page_md
 
     md = _render_front_page_md(_good_intel(), date(2026, 6, 9))
@@ -208,7 +211,7 @@ def test_render_front_page_md_emerging_section_absent_when_empty():
 # ---------------------------------------------------------------------------
 
 def test_prepend_pdf_merges_pages(tmp_path):
-    from pypdf import PdfWriter, PdfReader
+    from pypdf import PdfReader, PdfWriter
 
     def make_pdf(path, n_pages=1):
         writer = PdfWriter()
@@ -229,7 +232,7 @@ def test_prepend_pdf_merges_pages(tmp_path):
 
 
 def test_prepend_pdf_idempotent_on_rerun(tmp_path):
-    from pypdf import PdfWriter, PdfReader
+    from pypdf import PdfReader, PdfWriter
 
     def make_pdf(path, n_pages=1):
         writer = PdfWriter()
@@ -251,7 +254,7 @@ def test_prepend_pdf_idempotent_on_rerun(tmp_path):
 
 
 def test_prepend_pdf_preserves_briefing_title_metadata(tmp_path):
-    from pypdf import PdfWriter, PdfReader
+    from pypdf import PdfReader, PdfWriter
 
     def make_pdf(path, n_pages=1, metadata=None):
         writer = PdfWriter()
@@ -304,9 +307,10 @@ def test_prepend_pdf_no_tmp_file_left(tmp_path):
 
 def test_triaged_to_dicts_converts_correctly():
     from datetime import datetime, timezone
-    from tg_compiler.db import PostRecord, AnalysisRecord
-    from tg_compiler.triage import TriagedPost
+
+    from tg_compiler.db import AnalysisRecord, PostRecord
     from tg_compiler.synthesiser import _triaged_to_dicts
+    from tg_compiler.triage import TriagedPost
 
     post = PostRecord(
         channel_id=1,
@@ -354,9 +358,10 @@ def test_triaged_to_dicts_empty_list():
 
 def test_triaged_to_dicts_missing_title_defaults_empty():
     from datetime import datetime, timezone
-    from tg_compiler.db import PostRecord, AnalysisRecord
-    from tg_compiler.triage import TriagedPost
+
+    from tg_compiler.db import AnalysisRecord, PostRecord
     from tg_compiler.synthesiser import _triaged_to_dicts
+    from tg_compiler.triage import TriagedPost
 
     post = PostRecord(
         channel_id=2, channel_name="chan_b", message_id=99,
@@ -381,8 +386,9 @@ def test_triaged_to_dicts_missing_title_defaults_empty():
 async def test_run_analysis_no_briefing_returns_without_error(tmp_path, caplog):
     import logging
     from datetime import date
-    from tg_compiler.synthesiser import run_analysis
+
     from tg_compiler.config import AppConfig
+    from tg_compiler.synthesiser import run_analysis
 
     cfg = AppConfig.model_validate({
         "telegram": {"api_id": 1, "api_hash": "x", "channels": []},
@@ -399,8 +405,9 @@ async def test_run_analysis_no_briefing_returns_without_error(tmp_path, caplog):
 async def test_run_analysis_accepts_main_items_kwarg():
     """run_analysis must accept main_items=[] without error (empty → early exit)."""
     from datetime import date
-    from tg_compiler.synthesiser import run_analysis
+
     from tg_compiler.config import AppConfig
+    from tg_compiler.synthesiser import run_analysis
 
     cfg = AppConfig.model_validate({
         "telegram": {"api_id": 1, "api_hash": "x", "channels": []},

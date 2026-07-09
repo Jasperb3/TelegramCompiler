@@ -1,8 +1,14 @@
 import pytest
 from pydantic import ValidationError
+
 from tg_compiler.analyzer import (
-    PostAnalysis, parse_analysis_fallback, build_messages, _clean_image_insights,
-    _check_numeric_consistency, _sanitize, analysis_to_record,
+    PostAnalysis,
+    _check_numeric_consistency,
+    _clean_image_insights,
+    _sanitize,
+    analysis_to_record,
+    build_messages,
+    parse_analysis_fallback,
 )
 from tg_compiler.utils import clean_entities
 
@@ -170,7 +176,7 @@ def test_analysis_to_record_includes_title():
 
 @pytest.fixture
 def app_config():
-    from tg_compiler.config import AppConfig, TelegramConfig, LMStudioConfig
+    from tg_compiler.config import AppConfig, LMStudioConfig, TelegramConfig
 
     return AppConfig(
         telegram=TelegramConfig(api_id=1, api_hash="x", channels=[]),
@@ -179,9 +185,10 @@ def app_config():
 
 
 async def test_process_unanalysed_skips_short_textonly_post(db, app_config, monkeypatch):
+    from datetime import datetime, timezone
+
     from tg_compiler.analyzer import Analyzer
     from tg_compiler.db import PostRecord
-    from datetime import datetime, timezone
 
     short_post = PostRecord(
         channel_id=1, channel_name="chan", message_id=1,
@@ -216,9 +223,10 @@ async def test_process_unanalysed_skips_short_textonly_post(db, app_config, monk
 
 
 async def test_process_unanalysed_analyses_short_caption_video_post(db, app_config, monkeypatch):
+    from datetime import datetime, timezone
+
     from tg_compiler.analyzer import Analyzer
     from tg_compiler.db import PostRecord
-    from datetime import datetime, timezone
 
     video_post = PostRecord(
         channel_id=1, channel_name="chan", message_id=1,
@@ -277,9 +285,10 @@ def test_sanitize_escapes_image_description():
 
 
 async def test_process_unanalysed_aborts_when_server_unreachable(db, app_config, monkeypatch):
+    from datetime import datetime, timezone
+
     from tg_compiler.analyzer import Analyzer
     from tg_compiler.db import PostRecord
-    from datetime import datetime, timezone
 
     post = PostRecord(
         channel_id=1, channel_name="chan", message_id=1,
@@ -302,9 +311,10 @@ async def test_process_unanalysed_aborts_when_server_unreachable(db, app_config,
 
 
 async def test_process_unanalysed_leaves_post_queued_on_analysis_failure(db, app_config, monkeypatch):
+    from datetime import datetime, timezone
+
     from tg_compiler.analyzer import Analyzer
     from tg_compiler.db import PostRecord
-    from datetime import datetime, timezone
 
     post = PostRecord(
         channel_id=1, channel_name="chan", message_id=7,

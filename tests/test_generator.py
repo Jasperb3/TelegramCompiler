@@ -1,7 +1,8 @@
 from datetime import date, datetime, timezone
-from tg_compiler.db import PostRecord, AnalysisRecord
-from tg_compiler.triage import TriagedPost, BriefingContent, CorroborationRef
+
+from tg_compiler.db import AnalysisRecord, PostRecord
 from tg_compiler.generator import render_markdown
+from tg_compiler.triage import BriefingContent, CorroborationRef, TriagedPost
 
 
 def make_triaged(importance=4, category="Breaking News",

@@ -1,5 +1,6 @@
 """Tests for threat_level validation and defaulting."""
 import pytest
+
 from tg_compiler.analyzer import PostAnalysis
 
 

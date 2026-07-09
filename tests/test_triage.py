@@ -1,8 +1,10 @@
-from datetime import datetime, date, timezone, timedelta
-from tg_compiler.db import PostRecord, AnalysisRecord
-from tg_compiler.triage import triage, TriagedPost, BriefingContent, _jaccard, CorroborationRef, _normalize_entity
-from tg_compiler import triage as triage_module
+from datetime import date, datetime, timedelta, timezone
+
+from tg_compiler import utils as utils_module
 from tg_compiler.config import TriageConfig
+from tg_compiler.db import AnalysisRecord, PostRecord
+from tg_compiler.triage import BriefingContent, _jaccard, triage
+from tg_compiler.utils import normalize_entity
 
 
 def make_pair(
@@ -433,8 +435,8 @@ def test_entity_alias_normalization_clusters_duplicates(tmp_path, monkeypatch):
     # so only the alias-aware entity-overlap leg can trigger the match.
     alias_file = tmp_path / "entity_aliases.yaml"
     alias_file.write_text("acme corp: acme corporation\n")
-    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", alias_file)
-    triage_module._entity_aliases.cache_clear()
+    monkeypatch.setattr(utils_module, "_ENTITY_ALIASES_PATH", alias_file)
+    utils_module.entity_aliases.cache_clear()
 
     base_ts = datetime.now(timezone.utc)
     p1, a1 = make_pair(msg_id=1, importance=5,
@@ -450,7 +452,7 @@ def test_entity_alias_normalization_clusters_duplicates(tmp_path, monkeypatch):
         config = TriageConfig(min_composite_score=0.0)
         result = triage([(p1, a1), (p2, a2)], config)
     finally:
-        triage_module._entity_aliases.cache_clear()
+        utils_module.entity_aliases.cache_clear()
 
     total = len(result.main_items) + len(result.appendix_items)
     assert total == 1
@@ -667,22 +669,22 @@ def test_threat_multiplier_ranks_low_below_moderate():
 def test_entity_aliases_loaded_from_custom_file(tmp_path, monkeypatch):
     alias_file = tmp_path / "entity_aliases.yaml"
     alias_file.write_text("foo bar: baz corp\n")
-    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", alias_file)
-    triage_module._entity_aliases.cache_clear()
+    monkeypatch.setattr(utils_module, "_ENTITY_ALIASES_PATH", alias_file)
+    utils_module.entity_aliases.cache_clear()
     try:
-        assert _normalize_entity("Foo Bar") == "baz corp"
+        assert normalize_entity("Foo Bar") == "baz corp"
     finally:
-        triage_module._entity_aliases.cache_clear()
+        utils_module.entity_aliases.cache_clear()
 
 
 def test_entity_aliases_empty_without_custom_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", tmp_path / "missing.yaml")
-    triage_module._entity_aliases.cache_clear()
+    monkeypatch.setattr(utils_module, "_ENTITY_ALIASES_PATH", tmp_path / "missing.yaml")
+    utils_module.entity_aliases.cache_clear()
     try:
         # with no alias file, normalization is just lowercase + strip periods
-        assert _normalize_entity("U.S.") == "us"
+        assert normalize_entity("U.S.") == "us"
     finally:
-        triage_module._entity_aliases.cache_clear()
+        utils_module.entity_aliases.cache_clear()
 
 
 def test_entity_aliases_malformed_yaml_ignored_with_warning(tmp_path, monkeypatch, caplog):
@@ -690,11 +692,11 @@ def test_entity_aliases_malformed_yaml_ignored_with_warning(tmp_path, monkeypatc
 
     alias_file = tmp_path / "entity_aliases.yaml"
     alias_file.write_text("- foo\n- bar\n")  # a list, not a str->str mapping
-    monkeypatch.setattr(triage_module, "_ENTITY_ALIASES_PATH", alias_file)
-    triage_module._entity_aliases.cache_clear()
+    monkeypatch.setattr(utils_module, "_ENTITY_ALIASES_PATH", alias_file)
+    utils_module.entity_aliases.cache_clear()
     try:
         with caplog.at_level(logging.WARNING):
-            assert triage_module._entity_aliases() == {}
+            assert utils_module.entity_aliases() == {}
         assert any("not a flat string" in r.message for r in caplog.records)
     finally:
-        triage_module._entity_aliases.cache_clear()
+        utils_module.entity_aliases.cache_clear()

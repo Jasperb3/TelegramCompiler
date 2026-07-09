@@ -1,10 +1,11 @@
 from __future__ import annotations
+
 import os
 import re
 import zoneinfo
-import yaml
 from typing import Literal
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _GENERATE_AT_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -126,6 +127,20 @@ class AppConfig(BaseModel):
     triage: TriageConfig = Field(default_factory=TriageConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+
+    def channel_priority_map(self) -> dict[str, float]:
+        return {ch.slug: ch.priority for ch in self.telegram.channels}
+
+    def channel_credibility_map(self) -> dict[str, float]:
+        return {ch.slug: ch.credibility for ch in self.telegram.channels}
+
+    def channel_link_map(self) -> dict[str, str]:
+        """slug -> bare username (no @) for channels that have one, for t.me deep links."""
+        return {
+            ch.slug: ch.username.lstrip("@")
+            for ch in self.telegram.channels
+            if ch.username
+        }
 
 
 def load_config(path: str, env_override: bool = False) -> AppConfig:

@@ -7,6 +7,7 @@ import os
 import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from jinja2 import Environment, FileSystemLoader
 from openai import OpenAI
@@ -16,8 +17,16 @@ from tg_compiler.db import Database
 from tg_compiler.trends import TREND_WINDOW_DAYS, compute_trends
 from tg_compiler.utils import escape_html
 
+if TYPE_CHECKING:
+    from tg_compiler.triage import TriagedPost
+
 log = logging.getLogger(__name__)
 
+SYNTHESIS_TIMEOUT_SECS = 300      # LM Studio call timeout for the intel front-page synthesis
+SYNTHESIS_TEMPERATURE = 0.2       # low temperature: synthesis should stay grounded, not creative
+
+# TODO(packaging): resolves relative to the source tree, not package data — an
+# editable install (pip install -e) finds it, but a wheel/non-editable install won't.
 TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
 
 _SYNTHESIS_SYSTEM = (
@@ -104,7 +113,7 @@ async def synthesise(config: AppConfig, posts: list[dict], trends: dict | None =
         client = OpenAI(
             base_url=f"http://{cfg.server_host}:{cfg.server_port}/v1",
             api_key=cfg.api_token or "lm-studio",
-            timeout=300,
+            timeout=SYNTHESIS_TIMEOUT_SECS,
         )
     except Exception as e:
         log.error("LM Studio not reachable — cannot generate intelligence front page: %s", e)
@@ -135,7 +144,7 @@ async def synthesise(config: AppConfig, posts: list[dict], trends: dict | None =
                     {"role": "system", "content": _SYNTHESIS_SYSTEM},
                     {"role": "user", "content": user_message},
                 ],
-                temperature=0.2,
+                temperature=SYNTHESIS_TEMPERATURE,
                 max_tokens=cfg.synthesis_max_tokens,
             )
         )
@@ -145,7 +154,7 @@ async def synthesise(config: AppConfig, posts: list[dict], trends: dict | None =
 
     choice = response.choices[0]
     raw = choice.message.content or ""
-    log.debug("Synthesis raw response (finish_reason=%s): %s", choice.finish_reason, raw)
+    log.debug("Synthesis raw response (finish_reason=%s): %s", choice.finish_reason, raw[:2000])
 
     if not raw.strip():
         log.error(
@@ -293,7 +302,7 @@ def _md_to_pdf(md_text: str, date_str: str, date_dir: Path) -> Path:
 
 
 def _prepend_pdf(front_page_path: Path, briefing_path: Path) -> None:
-    from pypdf import PdfWriter, PdfReader
+    from pypdf import PdfReader, PdfWriter
 
     front_reader = PdfReader(str(front_page_path))
     briefing_reader = PdfReader(str(briefing_path))
@@ -332,7 +341,14 @@ def _prepend_pdf(front_page_path: Path, briefing_path: Path) -> None:
         raise
 
 
-async def run_analysis(config: AppConfig, target_date: date, main_items=None) -> None:
+async def run_analysis(
+    config: AppConfig, target_date: date, main_items: list["TriagedPost"] | None = None
+) -> None:
+    """Synthesise and prepend the intelligence front page for target_date's briefing
+    PDF. If main_items is given (passed from run_batch), synthesise from that triaged
+    post list directly; otherwise (standalone --analyse) re-triage the day's analysed
+    posts to reconstruct the same set. Never raises — failures are logged and the
+    existing briefing PDF is left untouched."""
     date_str = target_date.isoformat()
     date_dir = Path(config.generation.output_dir) / date_str
 
@@ -355,11 +371,9 @@ async def run_analysis(config: AppConfig, target_date: date, main_items=None) ->
                     date_str,
                 )
                 return
-            channel_priorities = {ch.slug: ch.priority for ch in config.telegram.channels}
-            channel_credibilities = {ch.slug: ch.credibility for ch in config.telegram.channels}
             content = do_triage(pairs, config.triage, today=target_date,
-                                 channel_priorities=channel_priorities,
-                                 channel_credibilities=channel_credibilities)
+                                 channel_priorities=config.channel_priority_map(),
+                                 channel_credibilities=config.channel_credibility_map())
             posts = _triaged_to_dicts(content.main_items)
         else:
             posts = _triaged_to_dicts(main_items)
@@ -386,12 +400,7 @@ async def run_analysis(config: AppConfig, target_date: date, main_items=None) ->
     finally:
         db.close()
 
-    channel_links = {
-        ch.slug: ch.username.lstrip("@")
-        for ch in config.telegram.channels
-        if ch.username
-    }
-    md = _render_front_page_md(intel, target_date, posts=posts, channel_links=channel_links, emerging_entities=trends["emerging_entities"])
+    md = _render_front_page_md(intel, target_date, posts=posts, channel_links=config.channel_link_map(), emerging_entities=trends["emerging_entities"])
     front_page_pdf = _md_to_pdf(md, date_str, date_dir)
 
     try:

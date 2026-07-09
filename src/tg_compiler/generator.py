@@ -1,7 +1,8 @@
 from __future__ import annotations
+
 import logging
+from datetime import datetime
 from pathlib import Path
-from datetime import date, datetime
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -10,6 +11,8 @@ from tg_compiler.utils import clean_entities
 
 log = logging.getLogger(__name__)
 
+# TODO(packaging): resolves relative to the source tree, not package data — an
+# editable install (pip install -e) finds it, but a wheel/non-editable install won't.
 TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
 
 
@@ -26,6 +29,9 @@ def _threat_badge(threat_level: str) -> str:
 
 
 def render_markdown(content: BriefingContent) -> str:
+    """Render the Jinja2 briefing template to markdown. Resolves each executive
+    (lead) item's post.media_paths to absolute paths in place before rendering —
+    fitz.Story (used by _render_pdf) needs absolute image srcs to embed them."""
     # Lead (executive) items are the only ones rendered with embedded images.
     for item in content.executive_items:
         item.post.media_paths = [str(Path(p).resolve()) for p in item.post.media_paths]
@@ -43,6 +49,9 @@ def generate_briefing(
     pdf: bool = False,
     layout: str = "desktop",
 ) -> Path:
+    """Render and save the markdown briefing to output_dir/YYYY-MM-DD/, optionally
+    also rendering a PDF via _render_pdf. Returns the PDF path if pdf=True, else
+    the markdown path."""
     date_str = content.date.isoformat()
     date_dir = Path(output_dir) / date_str
     date_dir.mkdir(parents=True, exist_ok=True)

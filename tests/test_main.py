@@ -1,10 +1,10 @@
 from datetime import datetime, timezone
 
 import pytest
-from tg_compiler.config import AppConfig, TelegramConfig, LMStudioConfig, ChannelConfig
-from tg_compiler import main as main_module
-from tg_compiler.main import _parse_since, purge_old_media, _share_pdf
 
+from tg_compiler import main as main_module
+from tg_compiler.config import AppConfig, ChannelConfig, LMStudioConfig, TelegramConfig
+from tg_compiler.main import _parse_since, _share_pdf, purge_old_media
 
 # ---------------------------------------------------------------------------
 # _parse_since
@@ -239,6 +239,7 @@ def daemon_config(tmp_path):
 async def test_run_daemon_logs_scheduler_crash(tmp_path, daemon_config, monkeypatch, caplog):
     import asyncio
     import logging
+
     import telethon
     from telethon.tl.types import PeerChannel
 
@@ -288,6 +289,7 @@ async def test_run_daemon_logs_scheduler_crash(tmp_path, daemon_config, monkeypa
 async def test_run_daemon_maps_channel_by_marked_peer_id(tmp_path, daemon_config, monkeypatch, caplog):
     import asyncio
     import logging
+
     import telethon
     from telethon import utils as telethon_utils
     from telethon.tl.types import PeerChannel
@@ -338,7 +340,7 @@ async def test_run_daemon_maps_channel_by_marked_peer_id(tmp_path, daemon_config
             from tg_compiler.analyzer import PostAnalysis
             return PostAnalysis(
                 title="Title", summary="Summary",
-                importance=1, urgency=1, credibility=1, relevance=1,
+                importance_score=1, urgency_score=1, credibility_score=1, relevance_score=1,
                 category="Other", key_entities=[], image_description=None,
                 threat_level="LOW",
             )
@@ -372,13 +374,192 @@ async def test_run_daemon_maps_channel_by_marked_peer_id(tmp_path, daemon_config
     assert not any("unmapped channel" in r.message for r in caplog.records)
 
 
+async def test_run_daemon_logs_stored_post_debug_line(tmp_path, daemon_config, monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    import telethon
+    from telethon import utils as telethon_utils
+    from telethon.tl.types import PeerChannel
+
+    daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
+
+    entity = PeerChannel(channel_id=12345)
+    marked_id = telethon_utils.get_peer_id(entity)
+
+    handlers = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
+
+        async def get_entity(self, identifier):
+            return entity
+
+        def on(self, *args, **kwargs):
+            def decorator(fn):
+                handlers.append(fn)
+                return fn
+            return decorator
+
+        async def run_until_disconnected(self):
+            await asyncio.sleep(0.05)
+
+        async def disconnect(self):
+            return None
+
+    async def fake_schedule_daily_generation(config):
+        return None
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def analyze_post(self, record, channel_cfg):
+            from tg_compiler.analyzer import PostAnalysis
+            return PostAnalysis(
+                title="Title", summary="Summary",
+                importance_score=1, urgency_score=1, credibility_score=1, relevance_score=1,
+                category="Other", key_entities=[], image_description=None,
+                threat_level="LOW",
+            )
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
+    monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+
+    await main_module.run_daemon(daemon_config)
+    handler = handlers[0]
+
+    class FakeMessage:
+        id = 1
+        text = "hello"
+        date = datetime.now(timezone.utc)
+        photo = None
+        video = None
+        gif = None
+
+    class FakeEvent:
+        chat_id = marked_id
+        message = FakeMessage()
+
+    with caplog.at_level(logging.DEBUG):
+        await handler(FakeEvent())
+
+    assert any(
+        "Stored post 1 from chan_a (analysed)" in r.message for r in caplog.records
+    )
+
+
+async def test_run_daemon_heartbeat_counts_stored_and_analysed(tmp_path, daemon_config, monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    import telethon
+    from telethon import utils as telethon_utils
+    from telethon.tl.types import PeerChannel
+
+    daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
+
+    entity = PeerChannel(channel_id=12345)
+    marked_id = telethon_utils.get_peer_id(entity)
+
+    handlers = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        async def connect(self):
+            return None
+
+        async def is_user_authorized(self):
+            return True
+
+        async def get_entity(self, identifier):
+            return entity
+
+        def on(self, *args, **kwargs):
+            def decorator(fn):
+                handlers.append(fn)
+                return fn
+            return decorator
+
+        async def run_until_disconnected(self):
+            await asyncio.sleep(0.02)
+
+        async def disconnect(self):
+            return None
+
+    async def fake_schedule_daily_generation(config):
+        return None
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def analyze_post(self, record, channel_cfg):
+            from tg_compiler.analyzer import PostAnalysis
+            return PostAnalysis(
+                title="Title", summary="Summary",
+                importance_score=1, urgency_score=1, credibility_score=1, relevance_score=1,
+                category="Other", key_entities=[], image_description=None,
+                threat_level="LOW",
+            )
+
+    monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
+    monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+    monkeypatch.setattr(main_module, "HEARTBEAT_INTERVAL_SECS", 0.01)
+
+    await main_module.run_daemon(daemon_config)
+    handler = handlers[0]
+
+    for i in range(1, 4):
+        class FakeMessage:
+            id = i
+            text = "hello"
+            date = datetime.now(timezone.utc)
+            photo = None
+            video = None
+            gif = None
+
+        class FakeEvent:
+            chat_id = marked_id
+            message = FakeMessage()
+
+        await handler(FakeEvent())
+
+    with caplog.at_level(logging.INFO):
+        await asyncio.sleep(0.05)
+
+    assert any(
+        "Daemon heartbeat: 3 posts stored, 3 analysed in the last hour" in r.message
+        for r in caplog.records
+    )
+
+
 async def test_run_daemon_advances_cursor(tmp_path, daemon_config, monkeypatch):
     """Daemon must advance channel_cursors so a later --batch doesn't re-walk the
     window the daemon already captured."""
     import asyncio
+
     import telethon
     from telethon import utils as telethon_utils
     from telethon.tl.types import PeerChannel
+
     from tg_compiler.db import Database
 
     daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
@@ -426,7 +607,7 @@ async def test_run_daemon_advances_cursor(tmp_path, daemon_config, monkeypatch):
             from tg_compiler.analyzer import PostAnalysis
             return PostAnalysis(
                 title="Title", summary="Summary",
-                importance=1, urgency=1, credibility=1, relevance=1,
+                importance_score=1, urgency_score=1, credibility_score=1, relevance_score=1,
                 category="Other", key_entities=[], image_description=None,
                 threat_level="LOW",
             )
@@ -525,8 +706,8 @@ async def test_generate_daily_briefing_offloads_pdf_render(tmp_path, daemon_conf
     """PDF render must run via asyncio.to_thread so the daemon event loop keeps
     servicing Telegram messages during generation."""
     import asyncio
+
     from tg_compiler.db import Database
-    from tg_compiler.triage import BriefingContent
 
     daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
     db = Database(daemon_config.storage.db_path)
@@ -557,6 +738,7 @@ async def test_generate_daily_briefing_offloads_pdf_render(tmp_path, daemon_conf
 async def test_run_daemon_skips_unresolvable_channel_and_continues(tmp_path, monkeypatch, caplog):
     import asyncio
     import logging
+
     import telethon
     from telethon.tl.types import PeerChannel
 
@@ -657,6 +839,7 @@ async def test_run_daemon_exits_when_all_channels_unresolvable(tmp_path, monkeyp
 
 async def test_run_daemon_honours_max_concurrent_analyses(tmp_path, daemon_config, monkeypatch):
     import asyncio
+
     import telethon
     from telethon import utils as telethon_utils
     from telethon.tl.types import PeerChannel
@@ -712,7 +895,7 @@ async def test_run_daemon_honours_max_concurrent_analyses(tmp_path, daemon_confi
             concurrency["current"] -= 1
             return PostAnalysis(
                 title="Title", summary="Summary",
-                importance=1, urgency=1, credibility=1, relevance=1,
+                importance_score=1, urgency_score=1, credibility_score=1, relevance_score=1,
                 category="Other", key_entities=[], image_description=None,
                 threat_level="LOW",
             )
@@ -745,6 +928,7 @@ async def test_run_daemon_honours_max_concurrent_analyses(tmp_path, daemon_confi
 
 async def test_run_daemon_skips_llm_call_after_recent_connection_failure(tmp_path, daemon_config, monkeypatch):
     import asyncio
+
     import httpx
     import telethon
     from openai import APIConnectionError

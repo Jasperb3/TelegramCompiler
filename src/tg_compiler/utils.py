@@ -1,9 +1,17 @@
 from __future__ import annotations
+
 import html
+import logging
 import os
 import re
 import sqlite3
 import sys
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+
+log = logging.getLogger(__name__)
 
 
 def escape_html(text: str) -> str:
@@ -66,3 +74,31 @@ def clean_entities(entities: list[str]) -> list[str]:
         and not re.fullmatch(r'\d+', e.strip())
         and not _ENTITY_GARBAGE.search(e)
     ]
+
+
+# Aliases for entity-overlap dedup so naming variants of the same actor match
+# (e.g. "U.S." and "United States" both normalize to "united states"). Keys are
+# compared with periods stripped. Defined entirely via entity_aliases.yaml
+# (gitignored, project root) — see entity_aliases.yaml.example. Empty if absent.
+_ENTITY_ALIASES_PATH = Path("entity_aliases.yaml")
+
+
+@lru_cache(maxsize=1)
+def entity_aliases() -> dict[str, str]:
+    if not _ENTITY_ALIASES_PATH.exists():
+        log.info("No entity_aliases.yaml found at %s — alias normalisation disabled", _ENTITY_ALIASES_PATH.resolve())
+        return {}
+    with open(_ENTITY_ALIASES_PATH) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
+    ):
+        log.warning("entity_aliases.yaml at %s is not a flat string→string mapping — ignoring it", _ENTITY_ALIASES_PATH.resolve())
+        return {}
+    log.info("Loaded %d entity aliases from %s", len(data), _ENTITY_ALIASES_PATH.resolve())
+    return data
+
+
+def normalize_entity(e: str) -> str:
+    stripped = e.strip().lower().replace(".", "")
+    return entity_aliases().get(stripped, stripped)
