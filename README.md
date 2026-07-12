@@ -125,6 +125,7 @@ lmstudio:
   # api_token: "lms-..."           # optional; overridden by LM_API_TOKEN env var
   temperature: 0.3
   max_tokens: 800
+  synthesis_max_tokens: 24000      # token budget for the intel front-page synthesis (keep generous: reasoning models deliberate before emitting JSON)
   max_concurrent_analyses: 1       # parallel LLM calls; increase if your GPU can handle it
 
 triage:
@@ -187,6 +188,22 @@ LM_API_TOKEN=your_api_token_here # required if LM Studio has authentication enab
 `TG_API_ID` and `TG_API_HASH` override the corresponding YAML fields. `LM_API_TOKEN` is only needed if you have enabled API token authentication in LM Studio's settings.
 
 If LM Studio is on a different machine, set `server_host` in `config.yaml` to its IP address (e.g. `192.168.1.96`). Note that the connection is plain HTTP — the API token and post content traverse the LAN unencrypted, so only do this on a trusted network.
+
+### Step 4 — (Optional) Entity aliases for better deduplication and trends
+
+Dedup and 7-day mention trends compare named entities after lowercasing and stripping periods, so `"U.S."` and `"US"` already match. For naming variants that need an explicit mapping (acronyms, alternate spellings, regional name variants), copy the example and add your own:
+
+```bash
+cp entity_aliases.yaml.example entity_aliases.yaml
+```
+
+```yaml
+# entity_aliases.yaml
+u.s.: united states
+dprk: north korea
+```
+
+This file is empty by default and gitignored — there are no built-in aliases, so without it entity normalisation is a no-op beyond the lowercase/strip-periods rule. Tailor it to the actors and regions your configured channels actually cover.
 
 ---
 
@@ -464,6 +481,15 @@ If LM Studio was unreachable during the synthesis step, a warning is logged and 
 **Session file issues after moving the project**  
 Delete `<session_name>.session` and re-authenticate by running `--batch` again.
 
+**Duplicate posts from a channel across old batch and daemon runs**  
+Older versions stored `channel_id` inconsistently between batch and daemon runs, which could let the same message slip past the `UNIQUE(channel_id, message_id)` constraint under two different IDs. `scripts/migrate_channel_ids.py` is a one-off migration that backs up the DB, merges the duplicate rows, and rebuilds `channel_cursors` under a consistent ID. Run it once against an affected database:
+```bash
+python scripts/migrate_channel_ids.py ./data/briefing.db
+# or preview without writing:
+python scripts/migrate_channel_ids.py ./data/briefing.db --dry-run
+```
+Not needed on a fresh database — only for one created before this fix.
+
 ---
 
 ## Running tests
@@ -476,3 +502,9 @@ pytest tests/test_triage.py::test_composite_score_formula -v   # single test
 ```
 
 Tests use in-memory SQLite and do not require Telegram credentials or a running LM Studio server.
+
+---
+
+## Project layout
+
+For a module-by-module breakdown of the pipeline (`scraper.py`, `analyzer.py`, `triage.py`, `generator.py`, `synthesiser.py`, `trends.py`, `db.py`, etc.) and the data-flow contracts between them, see [`CLAUDE.md`](./CLAUDE.md).
