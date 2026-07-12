@@ -128,6 +128,40 @@ def test_min_main_items_exceeding_max_rejected(tmp_path):
         load_config(str(f))
 
 
+def test_lmstudio_analysis_budget_defaults(tmp_path):
+    """A config without the analysis_* fields gets the documented defaults."""
+    f = tmp_path / "config.yaml"
+    f.write_text(MINIMAL_YAML)
+    cfg = load_config(str(f))
+    assert cfg.lmstudio.analysis_base_tokens == 1500
+    assert cfg.lmstudio.analysis_tokens_per_char == 0.3
+    assert cfg.lmstudio.analysis_tokens_per_image == 250
+    assert cfg.lmstudio.analysis_max_tokens == 4000
+
+
+def test_removed_lmstudio_max_tokens_rejected(tmp_path):
+    """max_tokens was replaced by the analysis_* budget fields; a stale config
+    still carrying it must fail loudly rather than silently doing nothing."""
+    bad_yaml = MINIMAL_YAML.replace(
+        'model: "gemma-3-4b-it"', 'model: "gemma-3-4b-it"\n  max_tokens: 800'
+    )
+    f = tmp_path / "config.yaml"
+    f.write_text(bad_yaml)
+    with pytest.raises(ValidationError):
+        load_config(str(f))
+
+
+def test_analysis_base_tokens_exceeding_max_rejected(tmp_path):
+    bad_yaml = MINIMAL_YAML.replace(
+        'model: "gemma-3-4b-it"',
+        'model: "gemma-3-4b-it"\n  analysis_base_tokens: 5000\n  analysis_max_tokens: 4000',
+    )
+    f = tmp_path / "config.yaml"
+    f.write_text(bad_yaml)
+    with pytest.raises(ValidationError):
+        load_config(str(f))
+
+
 def test_min_composite_score_default_is_3_5(tmp_path):
     f = tmp_path / "config.yaml"
     f.write_text(MINIMAL_YAML)

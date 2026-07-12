@@ -2,12 +2,15 @@ import pytest
 from pydantic import ValidationError
 
 from tg_compiler.analyzer import (
+    MAX_IMAGES_PER_POST,
+    MAX_PROMPT_TEXT_CHARS,
     PostAnalysis,
     _check_numeric_consistency,
     _clean_image_insights,
     _sanitize,
     analysis_to_record,
     build_messages,
+    compute_token_budget,
     parse_analysis_fallback,
 )
 from tg_compiler.utils import clean_entities
@@ -308,6 +311,163 @@ async def test_process_unanalysed_aborts_when_server_unreachable(db, app_config,
     assert called == []
     # post must remain queued — no sentinel or garbage analysis written
     assert len(db.get_unanalysed_posts()) == 1
+
+
+# --- dynamic per-post token budget ---
+
+
+def _budget_post(text="", media_paths=None):
+    from datetime import datetime, timezone
+
+    from tg_compiler.db import PostRecord
+
+    return PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 7, tzinfo=timezone.utc),
+        text=text, media_paths=media_paths or [], has_images=bool(media_paths),
+        raw_json="{}",
+    )
+
+
+@pytest.fixture
+def lm_cfg():
+    from tg_compiler.config import LMStudioConfig
+
+    return LMStudioConfig(model="test-model")
+
+
+def test_token_budget_empty_post_gets_base_budget(lm_cfg):
+    assert compute_token_budget(_budget_post(text=""), lm_cfg) == lm_cfg.analysis_base_tokens
+
+
+def test_token_budget_scales_with_text_length(lm_cfg):
+    import math
+
+    short = compute_token_budget(_budget_post(text="x" * 50), lm_cfg)
+    long = compute_token_budget(_budget_post(text="x" * 2000), lm_cfg)
+    assert short < long
+    assert long == lm_cfg.analysis_base_tokens + math.ceil(2000 * lm_cfg.analysis_tokens_per_char)
+
+
+def test_token_budget_counts_images(lm_cfg):
+    no_img = compute_token_budget(_budget_post(text="x" * 100), lm_cfg)
+    two_img = compute_token_budget(
+        _budget_post(text="x" * 100, media_paths=["a.jpg", "b.jpg"]), lm_cfg
+    )
+    assert two_img == no_img + 2 * lm_cfg.analysis_tokens_per_image
+
+
+def test_token_budget_clamped_at_max():
+    from tg_compiler.config import LMStudioConfig
+
+    cfg = LMStudioConfig(model="test-model", analysis_max_tokens=2000)
+    budget = compute_token_budget(
+        _budget_post(text="x" * 10000, media_paths=["a.jpg", "b.jpg", "c.jpg"]), cfg
+    )
+    assert budget == 2000
+
+
+def test_token_budget_ignores_text_beyond_prompt_truncation(lm_cfg):
+    # text past MAX_PROMPT_TEXT_CHARS is never sent to the LLM, so it must not
+    # inflate the budget: a post at the limit and one far past it budget the same
+    from tg_compiler.config import LMStudioConfig
+
+    cfg = LMStudioConfig(model="test-model", analysis_max_tokens=100000)
+    at_limit = compute_token_budget(_budget_post(text="x" * MAX_PROMPT_TEXT_CHARS), cfg)
+    past_limit = compute_token_budget(_budget_post(text="x" * (MAX_PROMPT_TEXT_CHARS * 3)), cfg)
+    assert at_limit == past_limit
+
+
+def test_token_budget_images_capped_at_max_images_per_post(lm_cfg):
+    at_cap = compute_token_budget(
+        _budget_post(media_paths=[f"{i}.jpg" for i in range(MAX_IMAGES_PER_POST)]), lm_cfg
+    )
+    past_cap = compute_token_budget(
+        _budget_post(media_paths=[f"{i}.jpg" for i in range(MAX_IMAGES_PER_POST + 3)]), lm_cfg
+    )
+    assert at_cap == past_cap
+
+
+def _fake_openai_client(calls, parsed=None, content=""):
+    """Minimal stand-in for the OpenAI client: records every parse/create call's
+    kwargs into `calls` and returns a canned completion."""
+    from types import SimpleNamespace
+
+    completion = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, content=content))]
+    )
+
+    def parse(**kwargs):
+        calls.append(("parse", kwargs))
+        return completion
+
+    def create(**kwargs):
+        calls.append(("create", kwargs))
+        return completion
+
+    return SimpleNamespace(
+        beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))),
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+
+
+def test_call_llm_passes_budget_to_structured_call(db, app_config):
+    from tg_compiler.analyzer import Analyzer
+
+    analyzer = Analyzer(app_config, db)
+    calls = []
+    analyzer._client = _fake_openai_client(calls, parsed=_analysis())
+    result = analyzer._call_llm([{"role": "user", "content": "hi"}], structured=True, max_tokens=1234)
+    assert isinstance(result, PostAnalysis)
+    assert calls == [("parse", calls[0][1])]
+    assert calls[0][1]["max_tokens"] == 1234
+
+
+def test_call_llm_passes_budget_to_fallback_call(db, app_config):
+    from tg_compiler.analyzer import Analyzer
+
+    analyzer = Analyzer(app_config, db)
+    calls = []
+    analyzer._client = _fake_openai_client(calls, content="not json")
+    analyzer._call_llm([{"role": "user", "content": "hi"}], structured=False, max_tokens=2345)
+    assert calls == [("create", calls[0][1])]
+    assert calls[0][1]["max_tokens"] == 2345
+
+
+async def test_analyze_post_uses_computed_budget(db, app_config):
+    from tg_compiler.analyzer import Analyzer
+
+    post = _budget_post(text="x" * 500, media_paths=["a.jpg"])
+    analyzer = Analyzer(app_config, db)
+    calls = []
+    analyzer._client = _fake_openai_client(calls, parsed=_analysis())
+    await analyzer.analyze_post(post)
+    expected = compute_token_budget(post, app_config.lmstudio)
+    assert calls[0][1]["max_tokens"] == expected
+
+
+async def test_analyze_post_fallback_call_uses_same_budget(db, app_config, monkeypatch):
+    import tg_compiler.analyzer as analyzer_mod
+    from tg_compiler.analyzer import Analyzer
+
+    monkeypatch.setattr(analyzer_mod, "RETRY_BACKOFF_BASE_SECS", 0)
+
+    post = _budget_post(text="x" * 500)
+    analyzer = Analyzer(app_config, db)
+    calls = []
+    client = _fake_openai_client(calls, content="not json")
+
+    def failing_parse(**kwargs):
+        calls.append(("parse", kwargs))
+        raise RuntimeError("length limit reached")
+
+    client.beta.chat.completions.parse = failing_parse
+    analyzer._client = client
+
+    await analyzer.analyze_post(post)
+    expected = compute_token_budget(post, app_config.lmstudio)
+    assert calls[-1][0] == "create"
+    assert all(kwargs["max_tokens"] == expected for _, kwargs in calls)
 
 
 async def test_process_unanalysed_leaves_post_queued_on_analysis_failure(db, app_config, monkeypatch):

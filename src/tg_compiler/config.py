@@ -39,9 +39,25 @@ class LMStudioConfig(BaseModel):
     server_port: int = 1234
     api_token: str | None = None
     temperature: float = 0.3
-    max_tokens: int = 800
+    # Dynamic per-post analysis token budget (replaces the old fixed max_tokens; see
+    # analyzer.compute_token_budget):
+    #   budget = min(analysis_base_tokens + text_chars * analysis_tokens_per_char
+    #                + images * analysis_tokens_per_image, analysis_max_tokens)
+    analysis_base_tokens: int = Field(default=1500, gt=0)        # flat floor: reasoning deliberation + structured JSON output
+    analysis_tokens_per_char: float = Field(default=0.3, ge=0)   # extra budget per prompt-text character
+    analysis_tokens_per_image: int = Field(default=250, ge=0)    # extra budget per attached image
+    analysis_max_tokens: int = Field(default=4000, gt=0)         # hard ceiling on any single analysis call
     synthesis_max_tokens: int = 24000  # token budget for the intel front-page synthesis (large: reasoning models deliberate before emitting JSON)
     max_concurrent_analyses: int = 1  # parallel LLM calls; increase if LM Studio can handle it
+
+    @model_validator(mode="after")
+    def _validate_analysis_budget_bounds(self) -> "LMStudioConfig":
+        if self.analysis_base_tokens > self.analysis_max_tokens:
+            raise ValueError(
+                f"analysis_base_tokens ({self.analysis_base_tokens}) must be <= "
+                f"analysis_max_tokens ({self.analysis_max_tokens})"
+            )
+        return self
 
 
 class TriageConfig(BaseModel):

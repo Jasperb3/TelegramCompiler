@@ -124,7 +124,16 @@ lmstudio:
   server_port: 1234
   # api_token: "lms-..."           # optional; overridden by LM_API_TOKEN env var
   temperature: 0.3
-  max_tokens: 800
+  # Per-post analysis token budget (replaces the old fixed max_tokens):
+  #   budget = min(analysis_base_tokens + text_chars * analysis_tokens_per_char
+  #                + images * analysis_tokens_per_image, analysis_max_tokens)
+  # Short posts stay cheap; long/image-heavy posts get headroom. The base is generous
+  # because reasoning models spend ~800+ tokens deliberating before emitting JSON, and
+  # LM Studio's OpenAI-compatible API has no separate reasoning-token control.
+  analysis_base_tokens: 1500       # flat floor: reasoning deliberation + structured JSON output
+  analysis_tokens_per_char: 0.3    # extra budget per character of prompt text (truncated at 3000 chars)
+  analysis_tokens_per_image: 250   # extra budget per attached image (max 3 per post)
+  analysis_max_tokens: 4000        # hard ceiling on any single analysis call
   synthesis_max_tokens: 24000      # token budget for the intel front-page synthesis (keep generous: reasoning models deliberate before emitting JSON)
   max_concurrent_analyses: 1       # parallel LLM calls; increase if your GPU can handle it
 

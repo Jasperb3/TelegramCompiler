@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Optional
@@ -10,7 +11,7 @@ from typing import Optional
 from openai import OpenAI
 from pydantic import BaseModel, Field, field_validator
 
-from tg_compiler.config import AppConfig, ChannelConfig
+from tg_compiler.config import AppConfig, ChannelConfig, LMStudioConfig
 from tg_compiler.db import AnalysisRecord, Database, PostRecord
 from tg_compiler.utils import _ENTITY_GARBAGE, clean_entities, escape_html
 
@@ -183,6 +184,30 @@ def build_messages(post: PostRecord, system_prompt: str) -> list[dict]:
     ]
 
 
+def compute_token_budget(post: PostRecord, cfg: LMStudioConfig) -> int:
+    """Per-post max_tokens for an analysis call.
+
+    LM Studio's OpenAI-compatible endpoint exposes no reasoning-token controls
+    (only max_tokens/temperature/sampling params), and reasoning models spend a
+    large, mostly length-independent chunk of the completion budget deliberating
+    before emitting JSON (~800 reasoning tokens observed even on a short post),
+    so the budget is a flat base — reasoning allowance plus the structured JSON
+    output — plus increments for the text and images actually sent in the prompt
+    (measured after build_messages' truncation/cap, so unsent content never
+    inflates the budget), clamped at analysis_max_tokens:
+
+        min(base + text_chars * per_char + images * per_image, max)
+    """
+    text_chars = min(len(post.text), MAX_PROMPT_TEXT_CHARS)
+    n_images = min(len(post.media_paths), MAX_IMAGES_PER_POST)
+    budget = (
+        cfg.analysis_base_tokens
+        + math.ceil(text_chars * cfg.analysis_tokens_per_char)
+        + n_images * cfg.analysis_tokens_per_image
+    )
+    return min(budget, cfg.analysis_max_tokens)
+
+
 _NUM_RE = re.compile(r'\b(\d+(?:\.\d+)?)\b')
 _TIME_TOKEN_RE = re.compile(r'\b\d{1,2}:\d{2}\b')  # e.g. "14:30"
 _YEAR_TOKEN_RE = re.compile(r'\b(?:19|20)\d{2}\b')  # e.g. "2026"
@@ -287,7 +312,9 @@ class Analyzer:
             )
         return self._client
 
-    def _call_llm(self, messages: list[dict], structured: bool) -> PostAnalysis | str:
+    def _call_llm(
+        self, messages: list[dict], structured: bool, max_tokens: int
+    ) -> PostAnalysis | str:
         cfg = self._cfg.lmstudio
         client = self._get_client()
         if structured:
@@ -296,7 +323,7 @@ class Analyzer:
                 messages=messages,
                 response_format=PostAnalysis,
                 temperature=cfg.temperature,
-                max_tokens=cfg.max_tokens,
+                max_tokens=max_tokens,
             )
             parsed = completion.choices[0].message.parsed
             if parsed is not None:
@@ -308,7 +335,7 @@ class Analyzer:
                 model=cfg.model,
                 messages=messages,
                 temperature=cfg.temperature,
-                max_tokens=cfg.max_tokens,
+                max_tokens=max_tokens,
             )
             raw = completion.choices[0].message.content or ""
 
@@ -330,10 +357,11 @@ class Analyzer:
             else SYSTEM_PROMPT
         )
         messages = build_messages(post, system)
+        budget = compute_token_budget(post, self._cfg.lmstudio)
 
         for attempt in range(ANALYSIS_MAX_ATTEMPTS):
             try:
-                result = await asyncio.to_thread(self._call_llm, messages, True)
+                result = await asyncio.to_thread(self._call_llm, messages, True, budget)
                 if isinstance(result, PostAnalysis):
                     return _sanitize(result)
                 return _sanitize(parse_analysis_fallback(result if isinstance(result, str) else ""))
@@ -346,7 +374,7 @@ class Analyzer:
                     # Last resort: plain-text call. If this also fails, propagate —
                     # writing a fabricated empty analysis would permanently mark the
                     # post as analysed and it would never be retried.
-                    result = await asyncio.to_thread(self._call_llm, messages, False)
+                    result = await asyncio.to_thread(self._call_llm, messages, False, budget)
                     if isinstance(result, PostAnalysis):
                         return _sanitize(result)
                     return _sanitize(parse_analysis_fallback(result if isinstance(result, str) else ""))
