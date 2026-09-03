@@ -77,7 +77,7 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
                                  "batch_size_with_images": batch_size})
     batches = A.plan_batches(posts, cfg)
     wall = prompt_t = completion_t = reasoning_t = 0.0
-    returned = 0
+    returned = aligned = 0
     finishes: dict[str, int] = {}
     analyses: list[dict] = []
 
@@ -126,6 +126,8 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
         for pos, item in enumerate(items):
             post = batch[0] if single else batch[min(getattr(item, "index", pos + 1) - 1,
                                                      len(batch) - 1)]
+            if single or A._opening_matches(getattr(item, "opening", ""), post):
+                aligned += 1
             analyses.append({
                 "message_id": post.message_id,
                 "title": item.title, "summary": item.summary,
@@ -138,6 +140,7 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
     n = len(posts)
     return {
         "model": model, "batch_size": batch_size, "posts": n, "returned": returned,
+        "aligned": aligned,
         "wall": wall, "s_per_post": wall / n if n else 0.0,
         "prompt_tokens": prompt_t, "completion_tokens": completion_t,
         "reasoning_per_post": reasoning_t / n if n else 0.0,

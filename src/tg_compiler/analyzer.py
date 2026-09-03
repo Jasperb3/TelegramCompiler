@@ -216,14 +216,21 @@ BATCH_INSTRUCTIONS = (
     "to each other: analyse each one strictly on its own content, and never carry facts, "
     "entities, figures, or wording from one post into another post's analysis. Return one "
     "object per post in \"analyses\", each carrying that post's 1-based \"index\" exactly as "
-    "given. Return an object for every post and nothing else."
+    "given, and \"opening\": the first six words of that post copied verbatim. Return an "
+    "object for every post and nothing else."
 )
 
 
 class BatchPostAnalysis(PostAnalysis):
-    """A PostAnalysis carrying the 1-based position of the post it describes."""
+    """A PostAnalysis carrying the 1-based position of the post it describes.
+
+    `opening` is an integrity anchor, not content: the model copies the first few
+    words of the post it actually analysed, which is the only way to tell that an
+    item is attached to the right post. See map_batch_results.
+    """
 
     index: int
+    opening: str = ""
 
 
 class BatchAnalysis(BaseModel):
@@ -319,24 +326,59 @@ def compute_batch_token_budget(posts: list[PostRecord], cfg: LMStudioConfig) -> 
     return min(budget, cfg.batch_max_tokens)
 
 
-def map_batch_results(batch: BatchAnalysis, batch_size: int) -> dict[int, PostAnalysis]:
+BATCH_OPENING_WORDS = 6           # words of each post the model echoes back as an integrity anchor
+BATCH_OPENING_MATCH_RATIO = 0.5   # fraction of those words that must appear in the post's own opening
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _opening_words(text: str, limit: int) -> list[str]:
+    return _WORD_RE.findall(text.lower())[:limit]
+
+
+def _opening_matches(opening: str, post: PostRecord) -> bool:
+    """Does the echoed opening actually come from this post?
+
+    Observed on google/gemma-3-4b: a model can drop one post from a batch and
+    renumber the rest densely, so every reported index is unique and in range
+    while the analyses are all attached to the wrong posts. Indices alone cannot
+    detect that; only something derived from the post's own text can.
+    """
+    claimed = _opening_words(opening, BATCH_OPENING_WORDS)
+    if not claimed:
+        return False
+    actual = set(_opening_words(post.text, BATCH_OPENING_WORDS * 3))
+    hits = sum(1 for w in claimed if w in actual)
+    return hits >= max(1, round(len(claimed) * BATCH_OPENING_MATCH_RATIO))
+
+
+def map_batch_results(batch: BatchAnalysis, posts: list[PostRecord]) -> dict[int, PostAnalysis]:
     """Map returned analyses onto batch positions by their reported `index`.
 
     Never by list position — a model that drops or reorders an item would
     otherwise silently attach an analysis to the wrong post. Out-of-range and
-    duplicate indices are dropped and logged; a position with no result is simply
-    absent from the returned dict, leaving that post unanalysed.
+    duplicate indices are dropped and logged, and each item must echo an opening
+    that actually belongs to the post it claims (see _opening_matches), which is
+    what catches a model that renumbers. A position with no surviving result is
+    simply absent from the returned dict, leaving that post unanalysed for the
+    caller to retry singly or requeue.
     """
     mapped: dict[int, PostAnalysis] = {}
     for item in batch.analyses:
         pos = item.index - 1
-        if not 0 <= pos < batch_size:
+        if not 0 <= pos < len(posts):
             log.warning(
-                "Batch result index %s outside 1..%d — dropped", item.index, batch_size
+                "Batch result index %s outside 1..%d — dropped", item.index, len(posts)
             )
             continue
         if pos in mapped:
             log.warning("Duplicate batch result index %s — keeping the first", item.index)
+            continue
+        if not _opening_matches(item.opening, posts[pos]):
+            log.warning(
+                "Batch result %d echoed opening %r, which does not match post %s — dropped "
+                "(the model may have renumbered its results)",
+                item.index, item.opening[:60], posts[pos].message_id,
+            )
             continue
         mapped[pos] = _sanitize(item)
     return mapped
@@ -601,7 +643,7 @@ class Analyzer:
                 result = await asyncio.to_thread(
                     self._call_batch_llm, messages, budget, len(posts)
                 )
-                return map_batch_results(result, len(posts))
+                return map_batch_results(result, posts)
             except Exception as e:
                 last_error = e
                 if attempt < BATCH_MAX_ATTEMPTS - 1:
