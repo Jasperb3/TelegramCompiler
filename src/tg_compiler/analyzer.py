@@ -627,6 +627,9 @@ class Analyzer:
         skipped (recorded with category="Skipped") rather than sent to the LLM.
         If `since` is given, only posts with timestamp >= since are analysed — older
         stuck-unanalysed posts are left queued for a future unscoped run.
+        When lmstudio.batch_size / batch_size_with_images exceed 1 the surviving
+        posts are grouped by plan_batches() and analysed several per LLM call;
+        at their default of 1 every post takes the original one-call-per-post path.
         Returns (analysed_count, skipped_count)."""
         posts = self._db.get_unanalysed_posts(since=since)
         if since is not None:

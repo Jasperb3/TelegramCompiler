@@ -16,3 +16,6 @@ issues/
 CLAUDE.md
 .antigravitycli/
 compare_models.py
+
+# benchmark sample: derived from the local DB, regenerated on demand
+scripts/bench_sample.json
