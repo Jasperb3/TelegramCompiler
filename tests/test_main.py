@@ -3,7 +3,13 @@ from datetime import datetime, timezone
 import pytest
 
 from tg_compiler import main as main_module
-from tg_compiler.config import AppConfig, ChannelConfig, LMStudioConfig, TelegramConfig
+from tg_compiler.config import (
+    AppConfig,
+    ChannelConfig,
+    LMStudioConfig,
+    StorageConfig,
+    TelegramConfig,
+)
 from tg_compiler.main import _parse_since, _share_pdf, purge_old_media
 
 # ---------------------------------------------------------------------------
@@ -470,14 +476,8 @@ async def test_run_daemon_logs_stored_post_debug_line(tmp_path, daemon_config, m
         def __init__(self, config, db):
             pass
 
-        async def analyze_post(self, record, channel_cfg):
-            from tg_compiler.analyzer import PostAnalysis
-            return PostAnalysis(
-                title="Title", summary="Summary",
-                importance_score=1, urgency_score=1, credibility_score=1, relevance_score=1,
-                category="Other", key_entities=[], image_description=None,
-                threat_level="LOW",
-            )
+        async def process_unanalysed(self, channel_map=None, since=None):
+            return 0, 0
 
     monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
     monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
@@ -501,9 +501,16 @@ async def test_run_daemon_logs_stored_post_debug_line(tmp_path, daemon_config, m
     with caplog.at_level(logging.DEBUG):
         await handler(FakeEvent())
 
-    assert any(
-        "Stored post 1 from chan_a (analysed)" in r.message for r in caplog.records
-    )
+    # The daemon stores on arrival and analyses in the periodic sweep, so the
+    # arrival line no longer claims the post was analysed.
+    assert any("Stored post 1 from chan_a" in r.message for r in caplog.records)
+    assert not any("(analysed)" in r.message for r in caplog.records)
+
+    from tg_compiler.db import Database
+    db = Database(daemon_config.storage.db_path)
+    db.init_schema()
+    assert [p.message_id for p in db.get_unanalysed_posts()] == [1]
+    db.close()
 
 
 async def test_run_daemon_heartbeat_counts_stored_and_analysed(tmp_path, daemon_config, monkeypatch, caplog):
@@ -556,19 +563,20 @@ async def test_run_daemon_heartbeat_counts_stored_and_analysed(tmp_path, daemon_
         def __init__(self, config, db):
             pass
 
-        async def analyze_post(self, record, channel_cfg):
-            from tg_compiler.analyzer import PostAnalysis
-            return PostAnalysis(
-                title="Title", summary="Summary",
-                importance_score=1, urgency_score=1, credibility_score=1, relevance_score=1,
-                category="Other", key_entities=[], image_description=None,
-                threat_level="LOW",
-            )
+        swept = {"done": False}
+
+        async def process_unanalysed(self, channel_map=None, since=None):
+            # the first sweep clears the three stored posts; later sweeps find none
+            if self.swept["done"]:
+                return 0, 0
+            self.swept["done"] = True
+            return 3, 0
 
     monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
     monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
     monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
-    monkeypatch.setattr(main_module, "HEARTBEAT_INTERVAL_SECS", 0.01)
+    monkeypatch.setattr(main_module, "HEARTBEAT_INTERVAL_SECS", 0.05)
+    monkeypatch.setattr(main_module, "DAEMON_ANALYSIS_INTERVAL_SECS", 0.01)
 
     await main_module.run_daemon(daemon_config)
     handler = handlers[0]
@@ -883,20 +891,22 @@ async def test_run_daemon_exits_when_all_channels_unresolvable(tmp_path, monkeyp
         await main_module.run_daemon(config)
 
 
-async def test_run_daemon_honours_max_concurrent_analyses(tmp_path, daemon_config, monkeypatch):
+async def test_run_daemon_sweep_scopes_analysis_to_daemon_uptime(tmp_path, daemon_config, monkeypatch):
+    """The sweep must pass `since`, or its first tick would try to analyse every
+    unanalysed post ever stored (~92k in the live database) with the daemon's
+    slower model. --batch stays the tool for historical catch-up."""
     import asyncio
+    from datetime import datetime, timedelta, timezone
 
     import telethon
     from telethon import utils as telethon_utils
     from telethon.tl.types import PeerChannel
 
     daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
-    daemon_config.lmstudio.max_concurrent_analyses = 1
     entity = PeerChannel(channel_id=12345)
     marked_id = telethon_utils.get_peer_id(entity)
-
     handlers = []
-    concurrency = {"current": 0, "peak": 0}
+    calls = []
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -921,7 +931,7 @@ async def test_run_daemon_honours_max_concurrent_analyses(tmp_path, daemon_confi
             return decorator
 
         async def run_until_disconnected(self):
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.03)
 
         async def disconnect(self):
             return None
@@ -933,60 +943,41 @@ async def test_run_daemon_honours_max_concurrent_analyses(tmp_path, daemon_confi
         def __init__(self, config, db):
             pass
 
-        async def analyze_post(self, record, channel_cfg):
-            from tg_compiler.analyzer import PostAnalysis
-            concurrency["current"] += 1
-            concurrency["peak"] = max(concurrency["peak"], concurrency["current"])
-            await asyncio.sleep(0.02)
-            concurrency["current"] -= 1
-            return PostAnalysis(
-                title="Title", summary="Summary",
-                importance_score=1, urgency_score=1, credibility_score=1, relevance_score=1,
-                category="Other", key_entities=[], image_description=None,
-                threat_level="LOW",
-            )
+        async def process_unanalysed(self, channel_map=None, since=None):
+            calls.append({"channel_map": channel_map, "since": since})
+            return 0, 0
 
     monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
     monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
     monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+    monkeypatch.setattr(main_module, "DAEMON_ANALYSIS_INTERVAL_SECS", 0.01)
 
+    before = datetime.now(timezone.utc) - timedelta(seconds=1)
     await main_module.run_daemon(daemon_config)
-    handler = handlers[0]
+    await asyncio.sleep(0.03)
 
-    class FakeMessage:
-        def __init__(self, mid):
-            self.id = mid
-            self.text = "hello"
-            self.date = datetime.now(timezone.utc)
-            self.photo = None
-            self.video = None
-            self.gif = None
-
-    class FakeEvent:
-        def __init__(self, mid):
-            self.chat_id = marked_id
-            self.message = FakeMessage(mid)
-
-    await asyncio.gather(handler(FakeEvent(1)), handler(FakeEvent(2)), handler(FakeEvent(3)))
-
-    assert concurrency["peak"] == 1
+    assert calls, "the analysis sweep never ran"
+    since = calls[0]["since"]
+    assert since is not None, "sweep ran unscoped — it would attack the whole backlog"
+    assert since >= before
+    # the channel map is passed so per-channel custom prompts still apply
+    assert marked_id in calls[0]["channel_map"]
 
 
-async def test_run_daemon_skips_llm_call_after_recent_connection_failure(tmp_path, daemon_config, monkeypatch):
+async def test_run_daemon_survives_a_failing_sweep(tmp_path, daemon_config, monkeypatch, caplog):
+    """A sweep that raises must be logged and the loop must continue — the daemon
+    runs for days and one bad cycle (LM Studio restarting, a DB lock) must not
+    silently end analysis for the rest of its life."""
     import asyncio
+    import logging
 
-    import httpx
     import telethon
-    from openai import APIConnectionError
-    from telethon import utils as telethon_utils
     from telethon.tl.types import PeerChannel
 
     daemon_config.storage.db_path = str(tmp_path / "db.sqlite")
     entity = PeerChannel(channel_id=12345)
-    marked_id = telethon_utils.get_peer_id(entity)
-
     handlers = []
-    call_count = {"n": 0}
+    attempts = {"n": 0}
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -1011,7 +1002,7 @@ async def test_run_daemon_skips_llm_call_after_recent_connection_failure(tmp_pat
             return decorator
 
         async def run_until_disconnected(self):
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.03)
 
         async def disconnect(self):
             return None
@@ -1023,42 +1014,21 @@ async def test_run_daemon_skips_llm_call_after_recent_connection_failure(tmp_pat
         def __init__(self, config, db):
             pass
 
-        async def analyze_post(self, record, channel_cfg):
-            call_count["n"] += 1
-            raise APIConnectionError(request=httpx.Request("POST", "http://localhost"))
+        async def process_unanalysed(self, channel_map=None, since=None):
+            attempts["n"] += 1
+            raise RuntimeError("LM Studio went away")
 
     monkeypatch.setattr(telethon, "TelegramClient", FakeClient)
     monkeypatch.setattr(main_module, "schedule_daily_generation", fake_schedule_daily_generation)
     monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+    monkeypatch.setattr(main_module, "DAEMON_ANALYSIS_INTERVAL_SECS", 0.01)
 
-    await main_module.run_daemon(daemon_config)
-    handler = handlers[0]
+    with caplog.at_level(logging.ERROR):
+        await main_module.run_daemon(daemon_config)
+        await asyncio.sleep(0.05)
 
-    class FakeMessage:
-        def __init__(self, mid):
-            self.id = mid
-            self.text = "hello"
-            self.date = datetime.now(timezone.utc)
-            self.photo = None
-            self.video = None
-            self.gif = None
-
-    class FakeEvent:
-        def __init__(self, mid):
-            self.chat_id = marked_id
-            self.message = FakeMessage(mid)
-
-    await handler(FakeEvent(1))
-    assert call_count["n"] == 1  # connection error recorded
-
-    await handler(FakeEvent(2))
-    assert call_count["n"] == 1  # second message within backoff window: LLM not called again
-
-    from tg_compiler.db import Database
-    db = Database(daemon_config.storage.db_path)
-    db.init_schema()
-    unanalysed = db.get_unanalysed_posts()
-    assert {p.message_id for p in unanalysed} == {1, 2}
+    assert attempts["n"] >= 2, "the sweep loop stopped after the first failure"
+    assert any("Analysis sweep failed" in r.message for r in caplog.records)
 
 
 async def test_scheduler_warns_when_generate_at_converts_to_near_midnight_utc(daemon_config, monkeypatch, caplog):
@@ -1103,3 +1073,110 @@ async def test_scheduler_no_warning_for_safe_generate_at(daemon_config, monkeypa
             await main_module.schedule_daily_generation(daemon_config)
 
     assert not any("converts to" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# CLI analysis-profile selection
+# --------------------------------------------------------------------------
+
+
+def _profile_config(tmp_path):
+    """A config with distinct batch/daemon analysis profiles."""
+    return AppConfig(
+        telegram=TelegramConfig(
+            api_id=1, api_hash="x", session_name=str(tmp_path / "session"),
+            channels=[ChannelConfig(slug="chan_a", username="@chan_a")],
+        ),
+        lmstudio=LMStudioConfig(
+            model="shared-model",
+            analysis_model="fallback-model",
+            analysis_profiles={
+                "batch": {"model": "small-model", "max_concurrent_analyses": 4},
+                "daemon": {"model": "big-model", "max_concurrent_analyses": 1},
+            },
+        ),
+        storage=StorageConfig(db_path=str(tmp_path / "db.sqlite"),
+                              media_dir=str(tmp_path / "media")),
+    )
+
+
+def _run_cli(monkeypatch, tmp_path, argv, seen):
+    """Invoke main() with the run functions stubbed, capturing the resolved config."""
+    import sys
+
+    cfg = _profile_config(tmp_path)
+    monkeypatch.setattr(main_module, "load_config", lambda *a, **kw: cfg)
+    monkeypatch.setattr(main_module.asyncio, "run", lambda coro: coro.close())
+    monkeypatch.setattr(main_module, "run_batch",
+                        lambda config, since=None: seen.update(config=config) or _noop())
+    monkeypatch.setattr(main_module, "run_daemon",
+                        lambda config: seen.update(config=config) or _noop())
+    monkeypatch.setattr(sys, "argv", ["tg_compiler", *argv])
+    main_module.main()
+
+
+def _noop():
+    async def _c():
+        return None
+    return _c()
+
+
+def test_cli_batch_selects_the_batch_profile(tmp_path, monkeypatch):
+    seen = {}
+    _run_cli(monkeypatch, tmp_path, ["--batch"], seen)
+    lm = seen["config"].lmstudio
+    assert lm.model_for("analysis") == "small-model"
+    assert lm.max_concurrent_analyses == 4
+
+
+def test_cli_daemon_selects_the_daemon_profile(tmp_path, monkeypatch):
+    seen = {}
+    _run_cli(monkeypatch, tmp_path, ["--daemon"], seen)
+    lm = seen["config"].lmstudio
+    assert lm.model_for("analysis") == "big-model"
+    assert lm.max_concurrent_analyses == 1
+
+
+def test_cli_since_uses_the_batch_profile(tmp_path, monkeypatch):
+    """--since is a --batch modifier, and shares its time-critical profile."""
+    seen = {}
+    _run_cli(monkeypatch, tmp_path, ["--batch", "--since", "2026-09-02"], seen)
+    assert seen["config"].lmstudio.model_for("analysis") == "small-model"
+
+
+def test_cli_analysis_profile_flag_overrides_the_mode_default(tmp_path, monkeypatch):
+    seen = {}
+    _run_cli(monkeypatch, tmp_path, ["--daemon", "--analysis-profile", "batch"], seen)
+    assert seen["config"].lmstudio.model_for("analysis") == "small-model"
+
+
+def test_cli_unknown_explicit_profile_exits(tmp_path, monkeypatch):
+    import pytest
+
+    with pytest.raises(SystemExit, match="Unknown analysis profile"):
+        _run_cli(monkeypatch, tmp_path, ["--batch", "--analysis-profile", "nope"], {})
+
+
+def test_cli_without_profiles_configured_is_unchanged(tmp_path, monkeypatch):
+    """A config predating profiles must behave exactly as before."""
+    import sys
+
+    cfg = AppConfig(
+        telegram=TelegramConfig(
+            api_id=1, api_hash="x", session_name=str(tmp_path / "session"),
+            channels=[ChannelConfig(slug="chan_a", username="@chan_a")],
+        ),
+        lmstudio=LMStudioConfig(model="only-model"),
+        storage=StorageConfig(db_path=str(tmp_path / "db.sqlite"),
+                              media_dir=str(tmp_path / "media")),
+    )
+    seen = {}
+    monkeypatch.setattr(main_module, "load_config", lambda *a, **kw: cfg)
+    monkeypatch.setattr(main_module.asyncio, "run", lambda coro: coro.close())
+    monkeypatch.setattr(main_module, "run_batch",
+                        lambda config, since=None: seen.update(config=config) or _noop())
+    monkeypatch.setattr(sys, "argv", ["tg_compiler", "--batch"])
+    main_module.main()
+
+    assert seen["config"] is cfg
+    assert seen["config"].lmstudio.model_for("analysis") == "only-model"

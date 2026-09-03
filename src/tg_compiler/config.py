@@ -32,6 +32,39 @@ class TelegramConfig(BaseModel):
     lookback_seconds: int = 604800  # how far back to fetch on first run (default: 1 week)
 
 
+class AnalysisProfile(BaseModel):
+    """Per-run-mode overrides for the analysis stage.
+
+    A model key alone is not portable between modes: token budgets, concurrency,
+    batch sizes and context length all have to match the model. bonsai-27b needs
+    analysis_base_tokens 9500 / max 16000 or its JSON is truncated mid-reasoning;
+    ministral-3-3b needs ~700/1600, and four concurrent image posts at bonsai's
+    budget exhausted LM Studio's context. So a profile carries the model *and*
+    the settings that must travel with it.
+
+    Every field is optional — a profile states only what differs from the
+    surrounding LMStudioConfig.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    model: str | None = None  # the analysis model; merged onto `analysis_model`
+    temperature: float | None = None
+    analysis_base_tokens: int | None = Field(default=None, gt=0)
+    analysis_tokens_per_char: float | None = Field(default=None, ge=0)
+    analysis_tokens_per_image: int | None = Field(default=None, ge=0)
+    analysis_max_tokens: int | None = Field(default=None, gt=0)
+    batch_size: int | None = Field(default=None, ge=1)
+    batch_size_with_images: int | None = Field(default=None, ge=1)
+    batch_images_per_post: int | None = Field(default=None, ge=1)
+    batch_base_tokens: int | None = Field(default=None, gt=0)
+    batch_tokens_per_post: int | None = Field(default=None, ge=0)
+    batch_tokens_per_char: float | None = Field(default=None, ge=0)
+    batch_tokens_per_image: int | None = Field(default=None, ge=0)
+    batch_max_tokens: int | None = Field(default=None, gt=0)
+    max_concurrent_analyses: int | None = Field(default=None, ge=1)
+    model_context_length: int | None = Field(default=None, gt=0)
+
+
 class LMStudioConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str
@@ -79,6 +112,10 @@ class LMStudioConfig(BaseModel):
     unload_others: bool = True         # free VRAM by unloading other LLMs before loading a stage's model
     model_ttl_seconds: int = Field(default=3600, gt=0)  # SDK TTL, so a crashed run can't strand a model
     model_context_length: int | None = Field(default=None, gt=0)  # load-time context override
+    # Named per-run-mode analysis profiles: --batch/--since select "batch",
+    # --daemon selects "daemon", and --analysis-profile overrides either.
+    # Empty by default, so a config without them behaves exactly as before.
+    analysis_profiles: dict[str, AnalysisProfile] = Field(default_factory=dict)
 
     def model_for(self, stage: str) -> str:
         """The model key for a pipeline stage, falling back to `model`.
@@ -87,6 +124,23 @@ class LMStudioConfig(BaseModel):
         the analyzer and the synthesiser.
         """
         return getattr(self, f"{stage}_model", None) or self.model
+
+    def with_analysis_profile(self, name: str | None) -> "LMStudioConfig":
+        """Apply a named analysis profile, or return self unchanged.
+
+        Rebuilds the model rather than using model_copy(update=...): model_copy
+        skips validators, so a profile setting analysis_base_tokens above
+        analysis_max_tokens would slip past _validate_analysis_budget_bounds.
+        """
+        profile = self.analysis_profiles.get(name) if name else None
+        if profile is None:
+            return self
+        overrides = profile.model_dump(exclude_none=True)
+        # A profile's `model` is the *analysis* model; `model` itself stays the
+        # global fallback that synthesis uses.
+        if "model" in overrides:
+            overrides["analysis_model"] = overrides.pop("model")
+        return LMStudioConfig(**{**self.model_dump(), **overrides})
 
     @model_validator(mode="after")
     def _validate_analysis_budget_bounds(self) -> "LMStudioConfig":
@@ -186,6 +240,19 @@ class AppConfig(BaseModel):
     triage: TriageConfig = Field(default_factory=TriageConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+
+    def with_analysis_profile(self, name: str | None) -> "AppConfig":
+        """This config with a named analysis profile applied to `lmstudio`.
+
+        Resolved once at CLI dispatch and passed to run_batch/run_daemon, so every
+        downstream reader of `config.lmstudio` — token budgets, batch sizes,
+        concurrency, the model key and the model_used provenance — follows without
+        any further plumbing.
+        """
+        resolved = self.lmstudio.with_analysis_profile(name)
+        if resolved is self.lmstudio:
+            return self
+        return self.model_copy(update={"lmstudio": resolved})
 
     def channel_priority_map(self) -> dict[str, float]:
         return {ch.slug: ch.priority for ch in self.telegram.channels}
