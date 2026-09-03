@@ -130,7 +130,7 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int,
         choice = completion.choices[0]
         finishes[choice.finish_reason] = finishes.get(choice.finish_reason, 0) + 1
 
-        parsed = choice.message.parsed
+        parsed = getattr(choice.message, "parsed", None)
         if parsed is None and not single:
             parsed = A.salvage_batch_items(choice.message.content or "")
         if parsed is None:
