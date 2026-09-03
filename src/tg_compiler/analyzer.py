@@ -330,9 +330,18 @@ def compute_batch_token_budget(posts: list[PostRecord], cfg: LMStudioConfig) -> 
 BATCH_OPENING_WORDS = 6           # words of each post the model echoes back as an integrity anchor
 BATCH_OPENING_MATCH_RATIO = 0.5   # fraction of those words that must appear in the post's own opening
 _WORD_RE = re.compile(r"[a-z0-9]+")
+# Telegram posts routinely carry a promo footer — @handle plus Socials/Donate/
+# Advertising links — which is pure noise for anchoring and can be most of a
+# short caption's tokens.
+_MD_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)")
+_URL_RE = re.compile(r"https?://\S+")
+_HANDLE_RE = re.compile(r"@\w+")
 
 
 def _opening_words(text: str, limit: int) -> list[str]:
+    text = _MD_LINK_RE.sub(" ", text)
+    text = _URL_RE.sub(" ", text)
+    text = _HANDLE_RE.sub(" ", text)
     return _WORD_RE.findall(text.lower())[:limit]
 
 
