@@ -586,11 +586,15 @@ def _batch_post(message_id, text="A post with enough text to clear the content g
     )
 
 
+_DEFAULT_POST_TEXT = "A post with enough text to clear the content gate."
+
+
 def _batch_item(index, **overrides):
     from tg_compiler.analyzer import BatchPostAnalysis
 
     base = dict(
         index=index,
+        opening=" ".join(_DEFAULT_POST_TEXT.split()[:6]),
         title=f"Title {index}",
         summary=f"Summary for post {index}.",
         importance_score=3, urgency_score=3, credibility_score=3, relevance_score=3,
@@ -697,7 +701,7 @@ def test_map_batch_results_maps_by_index_not_position():
     from tg_compiler.analyzer import BatchAnalysis, map_batch_results
 
     batch = BatchAnalysis(analyses=[_batch_item(3), _batch_item(1), _batch_item(2)])
-    mapped = map_batch_results(batch, 3)
+    mapped = map_batch_results(batch, [_batch_post(i) for i in range(1, 4)])
     assert set(mapped) == {0, 1, 2}
     assert mapped[0].summary == "Summary for post 1."
     assert mapped[2].summary == "Summary for post 3."
@@ -707,7 +711,7 @@ def test_map_batch_results_drops_out_of_range_index():
     from tg_compiler.analyzer import BatchAnalysis, map_batch_results
 
     batch = BatchAnalysis(analyses=[_batch_item(1), _batch_item(9), _batch_item(0)])
-    mapped = map_batch_results(batch, 2)
+    mapped = map_batch_results(batch, [_batch_post(i) for i in range(1, 3)])
     assert set(mapped) == {0}
 
 
@@ -718,14 +722,14 @@ def test_map_batch_results_keeps_first_of_duplicate_indices():
         _batch_item(1, summary="First one wins here."),
         _batch_item(1, summary="Second one is discarded."),
     ])
-    mapped = map_batch_results(batch, 2)
+    mapped = map_batch_results(batch, [_batch_post(i) for i in range(1, 3)])
     assert mapped[0].summary == "First one wins here."
 
 
 def test_map_batch_results_omits_positions_the_model_did_not_return():
     from tg_compiler.analyzer import BatchAnalysis, map_batch_results
 
-    mapped = map_batch_results(BatchAnalysis(analyses=[_batch_item(2)]), 3)
+    mapped = map_batch_results(BatchAnalysis(analyses=[_batch_item(2)]), [_batch_post(i) for i in range(1, 4)])
     assert set(mapped) == {1}
 
 
@@ -736,7 +740,7 @@ def test_map_batch_results_sanitizes_every_item():
         _batch_item(1, summary="Tanks <b>rolled</b> into the city & held it."),
         _batch_item(2, summary="The user provided no content for analysis."),
     ])
-    mapped = map_batch_results(batch, 2)
+    mapped = map_batch_results(batch, [_batch_post(i) for i in range(1, 3)])
     assert mapped[0].summary == "Tanks &lt;b&gt;rolled&lt;/b&gt; into the city &amp; held it."
     assert mapped[1].summary == ""
 
@@ -745,8 +749,9 @@ def test_salvage_batch_items_recovers_prefix_of_truncated_response():
     from tg_compiler.analyzer import salvage_batch_items
 
     complete = (
-        '{"index": 1, "title": "T1", "summary": "S1", "importance_score": 3, '
-        '"urgency_score": 3, "credibility_score": 3, "relevance_score": 3, '
+        '{"index": 1, "opening": "A post with enough text", "title": "T1", '
+        '"summary": "S1", "importance_score": 3, "urgency_score": 3, '
+        '"credibility_score": 3, "relevance_score": 3, '
         '"category": "Analysis", "key_entities": []}'
     )
     raw = '{"analyses": [' + complete + ', {"index": 2, "title": "T2", "sum'
@@ -800,9 +805,10 @@ async def test_analyze_batch_salvages_truncated_response(db):
     from tg_compiler.analyzer import Analyzer
 
     raw = (
-        '{"analyses": [{"index": 1, "title": "T1", "summary": "S1", '
-        '"importance_score": 3, "urgency_score": 3, "credibility_score": 3, '
-        '"relevance_score": 3, "category": "Analysis", "key_entities": []}, '
+        '{"analyses": [{"index": 1, "opening": "A post with enough text", '
+        '"title": "T1", "summary": "S1", "importance_score": 3, '
+        '"urgency_score": 3, "credibility_score": 3, "relevance_score": 3, '
+        '"category": "Analysis", "key_entities": []}, '
         '{"index": 2, "title": "T2"'
     )
     analyzer = Analyzer(_batch_config(batch_size=2), db)
@@ -1106,9 +1112,10 @@ async def test_analyze_batch_salvages_when_parse_raises_on_length_limit(db):
     from tg_compiler.analyzer import Analyzer
 
     raw = (
-        '{"analyses": [{"index": 1, "title": "T1", "summary": "S1", '
-        '"importance_score": 3, "urgency_score": 3, "credibility_score": 3, '
-        '"relevance_score": 3, "category": "Analysis", "key_entities": []}, '
+        '{"analyses": [{"index": 1, "opening": "A post with enough text", '
+        '"title": "T1", "summary": "S1", "importance_score": 3, '
+        '"urgency_score": 3, "credibility_score": 3, "relevance_score": 3, '
+        '"category": "Analysis", "key_entities": []}, '
         '{"index": 2, "title": "T2", "summ'
     )
     truncated = SimpleNamespace(
@@ -1129,3 +1136,54 @@ async def test_analyze_batch_salvages_when_parse_raises_on_length_limit(db):
     results = await analyzer.analyze_batch([_batch_post(1), _batch_post(2)])
     assert set(results) == {0}
     assert results[0].summary == "S1"
+
+
+def test_map_batch_results_rejects_a_renumbered_batch():
+    """Observed on google/gemma-3-4b: it dropped one post from a batch of 10 and
+    renumbered the rest densely 1..9, so every index was unique and in range while
+    each analysis described the *next* post. Indices alone cannot detect that."""
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    posts = [
+        _batch_post(1, text="Trump says the United States will resume bombing Iran tonight."),
+        _batch_post(2, text="Zelensky names Belarusian factories supplying Russian weapons."),
+        _batch_post(3, text="Prince Sultan Airbase in Al-Kharj is under ballistic missile attack."),
+    ]
+    # Each item echoes the opening of the post *after* the one it claims.
+    shifted = BatchAnalysis(analyses=[
+        _batch_item(1, opening="Zelensky names Belarusian factories supplying Russian"),
+        _batch_item(2, opening="Prince Sultan Airbase in Al-Kharj is"),
+    ])
+
+    assert map_batch_results(shifted, posts) == {}
+
+
+def test_map_batch_results_accepts_correctly_anchored_items():
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    posts = [
+        _batch_post(1, text="Trump says the United States will resume bombing Iran tonight."),
+        _batch_post(2, text="Zelensky names Belarusian factories supplying Russian weapons."),
+    ]
+    aligned = BatchAnalysis(analyses=[
+        _batch_item(1, opening="Trump says the United States will"),
+        _batch_item(2, opening="Zelensky names Belarusian factories supplying Russian"),
+    ])
+
+    assert set(map_batch_results(aligned, posts)) == {0, 1}
+
+
+def test_map_batch_results_drops_an_item_with_no_opening():
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    posts = [_batch_post(1, text="Trump says the United States will resume bombing Iran.")]
+    assert map_batch_results(BatchAnalysis(analyses=[_batch_item(1, opening="")]), posts) == {}
+
+
+def test_opening_match_tolerates_minor_paraphrase_and_punctuation():
+    from tg_compiler.analyzer import _opening_matches
+
+    post = _batch_post(1, text="**BREAKING:** Prince Sultan Airbase, Al-Kharj, is under attack.")
+    # punctuation and markdown stripped, most words still present
+    assert _opening_matches("BREAKING Prince Sultan Airbase Al-Kharj is", post) is True
+    assert _opening_matches("Zelensky names Belarusian factories supplying weapons", post) is False
