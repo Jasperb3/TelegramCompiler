@@ -242,7 +242,11 @@ class BatchPostAnalysis(PostAnalysis):
     """
 
     index: int
-    opening: str = ""
+    # No default: a field with one is left out of the JSON schema's "required"
+    # list, and grammar-constrained decoding then never forces the model to emit
+    # it. mistralai/ministral-3-3b omitted it on ~12% of items, each of which was
+    # dropped as unverifiable and pushed onto the slow per-post path.
+    opening: str
 
 
 class BatchAnalysis(BaseModel):

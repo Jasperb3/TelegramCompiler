@@ -1209,3 +1209,15 @@ def test_clean_image_insights_rejects_descriptions_that_say_there_is_nothing_ext
 ])
 def test_clean_image_insights_keeps_substantive_descriptions(description):
     assert _clean_image_insights(description) == description
+
+
+def test_batch_schema_requires_the_opening_anchor():
+    """A pydantic default would keep `opening` out of the JSON schema's "required"
+    list, so LM Studio's grammar-constrained decoding would never force the model
+    to emit it. Observed live: ministral-3-3b then omitted it on ~12% of items,
+    each dropped as unverifiable and retried on the slow per-post path."""
+    from tg_compiler.analyzer import BatchPostAnalysis
+
+    required = BatchPostAnalysis.model_json_schema()["required"]
+    assert "opening" in required
+    assert "index" in required
