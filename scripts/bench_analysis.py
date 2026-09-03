@@ -77,7 +77,7 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
                                  "batch_size_with_images": batch_size})
     batches = A.plan_batches(posts, cfg)
     wall = prompt_t = completion_t = reasoning_t = 0.0
-    returned = aligned = 0
+    returned = aligned = misattributed = unverified = 0
     finishes: dict[str, int] = {}
     analyses: list[dict] = []
 
@@ -126,8 +126,15 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
         for pos, item in enumerate(items):
             post = batch[0] if single else batch[min(getattr(item, "index", pos + 1) - 1,
                                                      len(batch) - 1)]
-            if single or A._opening_matches(getattr(item, "opening", ""), post):
+            verdict = "match" if single else A.check_opening(
+                getattr(item, "opening", ""), post
+            )
+            if verdict == "match":
                 aligned += 1
+            elif verdict == "mismatch":
+                misattributed += 1
+            else:
+                unverified += 1
             analyses.append({
                 "message_id": post.message_id,
                 "title": item.title, "summary": item.summary,
@@ -140,7 +147,7 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
     n = len(posts)
     return {
         "model": model, "batch_size": batch_size, "posts": n, "returned": returned,
-        "aligned": aligned,
+        "aligned": aligned, "misattributed": misattributed, "unverified": unverified,
         "wall": wall, "s_per_post": wall / n if n else 0.0,
         "prompt_tokens": prompt_t, "completion_tokens": completion_t,
         "reasoning_per_post": reasoning_t / n if n else 0.0,
@@ -181,12 +188,24 @@ def main() -> None:
             cells.append(run_cell(client, lm, model.strip(), posts, size))
 
     print(f"\n{len(posts)} posts, {'with images' if args.with_images else 'text-only'}\n")
-    print("| model | batch | s/post | returned | reasoning tok/post | completion tok | finish |")
-    print("|---|---|---|---|---|---|---|")
+    print("| model | batch | s/post | returned | aligned | misattrib | unverified "
+          "| reasoning tok/post | completion tok | finish |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for c in cells:
         print(f"| {c['model']} | {c['batch_size']} | {c['s_per_post']:.1f} | "
-              f"{c['returned']}/{c['posts']} | {c['reasoning_per_post']:.0f} | "
+              f"{c['returned']}/{c['posts']} | {c['aligned']} | {c['misattributed']} | "
+              f"{c['unverified']} | {c['reasoning_per_post']:.0f} | "
               f"{c['completion_tokens']:.0f} | {c['finish_reasons']} |")
+
+    bad = [c for c in cells if c["misattributed"]]
+    if bad:
+        print("\n*** MISATTRIBUTION — these models attached analyses to the wrong posts:")
+        for c in bad:
+            print(f"  {c['model']} @ batch {c['batch_size']}: {c['misattributed']} of "
+                  f"{c['returned']} returned items described a different post")
+    if any(c["unverified"] for c in cells):
+        print("\n(unverified = no opening anchor returned, so alignment could not be checked "
+              "— not evidence of misattribution)")
 
     if len(cells) > 1:
         best = min(cells, key=lambda c: c["s_per_post"])

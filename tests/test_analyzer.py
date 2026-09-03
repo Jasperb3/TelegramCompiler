@@ -1115,3 +1115,28 @@ def test_opening_match_tolerates_minor_paraphrase_and_punctuation():
     # punctuation and markdown stripped, most words still present
     assert _opening_matches("BREAKING Prince Sultan Airbase Al-Kharj is", post) is True
     assert _opening_matches("Zelensky names Belarusian factories supplying weapons", post) is False
+
+
+def test_check_opening_distinguishes_mismatch_from_absent():
+    """A missing anchor means 'could not verify'; a wrong anchor means the model
+    attributed this analysis to another post. Conflating them would report a model
+    that ignores the field as one that corrupts data."""
+    from tg_compiler.analyzer import check_opening
+
+    post = _batch_post(1, text="Trump says the United States will resume bombing Iran tonight.")
+    assert check_opening("Trump says the United States will", post) == "match"
+    assert check_opening("Zelensky names Belarusian factories supplying weapons", post) == "mismatch"
+    assert check_opening("", post) == "absent"
+    assert check_opening("   ", post) == "absent"
+
+
+def test_map_batch_results_drops_unverifiable_items_without_calling_them_mismatches(caplog):
+    import logging
+
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    posts = [_batch_post(1, text="Trump says the United States will resume bombing Iran.")]
+    with caplog.at_level(logging.WARNING):
+        assert map_batch_results(BatchAnalysis(analyses=[_batch_item(1, opening="")]), posts) == {}
+    assert "could not be verified" in caplog.text
+    assert "renumbered" not in caplog.text
