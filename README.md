@@ -50,9 +50,23 @@ python --version   # must be 3.11 or newer
 
 Download from [https://lmstudio.ai](https://lmstudio.ai) and install it. You need a Vision-Language Model (VLM) loaded — one that can analyse images alongside text.
 
-Recommended model (small and capable):
-- `google/gemma-4-12b-qat` — default model, excellent intelligence and vision capabilities
-- Alternatively you can try a larger GGUF model with vision support
+The pipeline can use **one model for everything, or a different model per stage**
+(see `analysis_model` / `synthesis_model` below). The two stages want different
+things:
+
+- **Analysis** scores every scraped post — a thousand or more a day. It wants a
+  small, fast, *non-reasoning* VLM. A reasoning model spends most of its output
+  budget deliberating (measured: 3,515 reasoning tokens per post against ~250
+  tokens of actual JSON), which makes a day's analysis take many hours.
+- **Synthesis** writes the intelligence front page once a day from the already
+  triaged posts. Reasoning genuinely helps here and costs one call.
+
+Recommended pairing:
+- Analysis: `mistralai/ministral-3-3b` (3B + 0.4B vision encoder, ~1-3 s/post)
+- Synthesis: any larger reasoning model you like
+
+A single capable VLM such as `google/gemma-4-12b-qat` also works for both — just
+leave `analysis_model` and `synthesis_model` unset.
 
 To start the server inside LM Studio: **Local Server → Start Server** (default port 1234).
 
@@ -135,7 +149,20 @@ lmstudio:
   analysis_tokens_per_image: 250   # extra budget per attached image (max 3 per post)
   analysis_max_tokens: 4000        # hard ceiling on any single analysis call
   synthesis_max_tokens: 24000      # token budget for the intel front-page synthesis (keep generous: reasoning models deliberate before emitting JSON)
-  max_concurrent_analyses: 1       # parallel LLM calls; increase if your GPU can handle it
+  max_concurrent_analyses: 4       # parallel LLM calls; see "Throughput" below
+
+  # --- Per-stage models (optional; both fall back to `model`) ---
+  analysis_model: "mistralai/ministral-3-3b"   # fast non-reasoning VLM for scoring every post
+  synthesis_model: "prism-ml/bonsai-27b"       # reasoning model for the daily front page
+  manage_models: true              # load/unload each stage's model via the LM Studio SDK
+  unload_others: true              # free VRAM before loading the next stage's model
+  model_ttl_seconds: 3600          # LM Studio unloads an idle model after this
+  # model_context_length: 32768    # optional load-time context override
+
+  # --- Batched analysis (optional; 1 = one post per call, the default) ---
+  batch_size: 1                    # text-only posts per LLM call
+  batch_size_with_images: 1        # media-bearing posts per LLM call
+  # Only worth raising for a *reasoning* analysis model — see "Throughput" below.
 
 triage:
   keywords: ["urgent", "breaking", "launch"]  # words that add keyword_boost to a post's score
@@ -391,6 +418,71 @@ The default can also be set permanently via `generation.pdf_layout` in `config.y
 ### Sharing the PDF — `share_to_directory`
 
 Set `generation.share_to_directory` in `config.yaml` to a directory path, and the final generated PDF (after the intelligence front page has been prepended) is copied there too — e.g. a Syncthing/Dropbox/Nextcloud folder for reading on another device. Leave it unset (the default) to disable this.
+
+---
+
+## Throughput — choosing an analysis model, batch size and concurrency
+
+Analysis dominates runtime: it touches every scraped post (1,000–1,700 a day on a
+16-channel setup), while everything downstream runs once. The settings below were
+chosen from measurements on an RTX 3080 Ti Laptop (16 GB), and the numbers are
+recorded here so they can be re-checked rather than guessed at.
+
+**Reasoning tokens are the thing that matters.** On a reasoning model, 93–97% of
+every generated token is deliberation the briefing never sees:
+
+| model | s/post (one post per call) | reasoning tokens/post |
+|---|---|---|
+| `prism-ml/bonsai-27b` (reasoning) | 85.8 | 3,878 |
+| `mistralai/ministral-3-3b` | 2.2–3.0 | **0** |
+| `google/gemma-3-4b` | 2.9 | 0 |
+
+LM Studio exposes no way to cap reasoning separately — `reasoning_effort`,
+`chat_template_kwargs.enable_thinking` and `reasoning: {effort}` were all accepted
+and ignored — so the only remedy is a model that does not deliberate.
+
+**Batching helps reasoning models, and only them.** Several posts in one call
+amortise the per-call deliberation. On `bonsai-27b` a batch of 10 cut reasoning
+from 3,515 to 693 tokens per post (191 → 39.6 s/post). On a non-reasoning model
+there is nothing to amortise, and batching costs output quality:
+
+| batch (ministral) | s/post | mean summary chars | mean entities |
+|---|---|---|---|
+| **1** | 3.0 | **281** | **3.6** |
+| 5 | 2.0 | 180 | 2.8 |
+| 10 | 1.8 | 179 | 2.3 |
+
+Batch 10 buys 1.7x on text (1.07x on images) for 36% shorter summaries, 36% fewer
+entities, and only ~50% category agreement with the model's own single-post
+output. **So: keep `batch_size: 1` for a fast model; raise it only if you point
+analysis at a reasoning model.** Everything the batch path adds — index mapping,
+the anchor check, salvage, the fallback ladder — is inert at size 1.
+
+**Concurrency is the better lever for a small model**, but its ceiling is set by
+total concurrent context, not by the request count:
+
+| configuration | s/post | outcome |
+|---|---|---|
+| batch 1, `max_concurrent_analyses: 1` | 2.17 | all OK |
+| batch 1, `max_concurrent_analyses: 4` | **1.10** | all OK |
+| batch 10, `max_concurrent_analyses: 4` | — | **every request failed** |
+
+Large concurrent requests exhaust context and fail outright. Keep
+`analysis_*` token budgets sized for the model actually doing the analysis: a
+budget tuned for a reasoning model (`analysis_max_tokens: 16000`) reserves far
+more than a small model needs, and four such image-post requests at once will
+fail. A non-reasoning model needs roughly 250 output tokens per post.
+
+Realistic end-to-end figure for a full day of 1,239 real posts with
+`batch_size: 1` and `max_concurrent_analyses: 4`: **2.6 s/post, ~52 minutes**.
+Microbenchmarks on short text-only posts report ~1.1 s/post; a real day includes
+image posts and long posts, so expect the higher figure.
+
+**Model swapping.** With `manage_models: true` the analyzer and synthesiser each
+load their own model at stage entry via the LM Studio Python SDK, unloading the
+other first. This is required when the two models cannot co-reside in VRAM — a
+27B model occupies ~12 GB of a 16 GB card. With `manage_models: false` (the
+default) nothing is loaded or unloaded and whatever is already running is used.
 
 ---
 
