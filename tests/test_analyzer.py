@@ -1092,3 +1092,40 @@ async def test_analysis_row_records_the_analysis_model(db, monkeypatch):
 
     pairs = db.get_days_posts_with_analyses("2026-06-07")
     assert pairs[0][1].model_used == "small-model"
+async def test_analyze_batch_salvages_when_parse_raises_on_length_limit(db):
+    """A response cut off at max_tokens reaches us as an exception, not a value.
+
+    client.beta.chat.completions.parse() raises LengthFinishReasonError rather than
+    returning the truncated completion, so without unwrapping it the whole batch's
+    work — thousands of generated tokens — is discarded.
+    """
+    from types import SimpleNamespace
+
+    from openai import LengthFinishReasonError
+
+    from tg_compiler.analyzer import Analyzer
+
+    raw = (
+        '{"analyses": [{"index": 1, "title": "T1", "summary": "S1", '
+        '"importance_score": 3, "urgency_score": 3, "credibility_score": 3, '
+        '"relevance_score": 3, "category": "Analysis", "key_entities": []}, '
+        '{"index": 2, "title": "T2", "summ'
+    )
+    truncated = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(parsed=None, content=raw), finish_reason="length",
+        )],
+        usage=None,
+    )
+
+    def parse(**_kwargs):
+        raise LengthFinishReasonError(completion=truncated)
+
+    analyzer = Analyzer(_batch_config(batch_size=2), db)
+    analyzer._client = SimpleNamespace(
+        beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse)))
+    )
+
+    results = await analyzer.analyze_batch([_batch_post(1), _batch_post(2)])
+    assert set(results) == {0}
+    assert results[0].summary == "S1"

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from openai import OpenAI
+from openai import LengthFinishReasonError, OpenAI
 from pydantic import BaseModel, Field, field_validator
 
 from tg_compiler.config import AppConfig, ChannelConfig, LMStudioConfig
@@ -550,13 +550,20 @@ class Analyzer:
 
     def _call_batch_llm(self, messages: list[dict], max_tokens: int, expected: int) -> BatchAnalysis:
         cfg = self._cfg.lmstudio
-        completion = self._get_client().beta.chat.completions.parse(
-            model=cfg.model_for("analysis"),
-            messages=messages,
-            response_format=BatchAnalysis,
-            temperature=cfg.temperature,
-            max_tokens=max_tokens,
-        )
+        try:
+            completion = self._get_client().beta.chat.completions.parse(
+                model=cfg.model_for("analysis"),
+                messages=messages,
+                response_format=BatchAnalysis,
+                temperature=cfg.temperature,
+                max_tokens=max_tokens,
+            )
+        except LengthFinishReasonError as e:
+            # .parse() refuses a response cut off at max_tokens instead of
+            # returning it, but the objects emitted before the cut are intact and
+            # the batch's remaining posts simply get requeued. Without this the
+            # whole call's work — thousands of tokens — would be thrown away.
+            completion = e.completion
         choice = completion.choices[0]
         if choice.message.parsed is not None:
             return choice.message.parsed
@@ -571,7 +578,9 @@ class Analyzer:
             # objects that made it out and let the caller requeue the rest.
             salvaged = salvage_batch_items(raw)
             log.warning(
-                "Batch response was not valid JSON (finish_reason=%s) — salvaged %d of %d items",
+                "Batch response was not valid JSON (finish_reason=%s) — salvaged %d of %d items."
+                " If finish_reason is 'length', raise lmstudio.batch_base_tokens or lower"
+                " batch_size; the unreturned posts are requeued for the next run.",
                 choice.finish_reason, len(salvaged.analyses), expected,
             )
             return salvaged

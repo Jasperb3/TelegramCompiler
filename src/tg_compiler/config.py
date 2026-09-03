@@ -58,10 +58,14 @@ class LMStudioConfig(BaseModel):
     #   budget = min(batch_base_tokens + posts * batch_tokens_per_post
     #                + text_chars * batch_tokens_per_char
     #                + images * batch_tokens_per_image, batch_max_tokens)
-    batch_base_tokens: int = Field(default=2000, gt=0)      # flat shared reasoning allowance per batch call
-    batch_tokens_per_post: int = Field(default=400, ge=0)   # per-post JSON output allowance
+    # Defaults sized from measurement so a reasoning model doesn't truncate: a batch
+    # of 10 text posts spent 9,364 completion tokens on prism-ml/bonsai-27b, a batch
+    # of 3 image posts 7,668. max_tokens is a cap, not an allocation, so headroom
+    # costs a non-reasoning model nothing.
+    batch_base_tokens: int = Field(default=4000, gt=0)       # flat shared reasoning allowance per batch call
+    batch_tokens_per_post: int = Field(default=600, ge=0)    # per-post JSON output allowance
     batch_tokens_per_char: float = Field(default=0.3, ge=0)  # per character of batched prompt text
-    batch_tokens_per_image: int = Field(default=400, ge=0)   # per image attached in a batch
+    batch_tokens_per_image: int = Field(default=1200, ge=0)  # per image attached in a batch
     batch_max_tokens: int = Field(default=32000, gt=0)      # hard ceiling on any batch call
     batch_max_prompt_chars: int = Field(default=24000, gt=0)  # split a batch whose prompt text exceeds this
     batch_min_yield_ratio: float = Field(default=0.6, ge=0.0, le=1.0)  # below this, retry the batch's posts singly
