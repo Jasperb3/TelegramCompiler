@@ -324,6 +324,19 @@ Accepted formats: `HH:MM` (today at that UTC time), `YYYY-MM-DD` (midnight on th
 
 Daemon mode runs indefinitely, listening for new messages in real time and generating a PDF automatically at the configured `generate_at` time each day.
 
+**How posts get analysed.** The daemon stores each post the moment it arrives,
+then analyses newly stored posts in a sweep every 10 minutes
+(`DAEMON_ANALYSIS_INTERVAL_SECS` in `main.py`) rather than one at a time on
+arrival. Analysis is therefore *eventually* consistent — a post is analysed
+within a sweep interval, not instantly — which is invisible to a once-nightly
+briefing and is what lets the daemon use a slower, better model (see
+[Run modes and analysis profiles](#run-modes-and-analysis-profiles)). Posts that
+arrive mid-sweep are picked up by the next one; the queue lives in the database,
+so nothing is lost if the daemon restarts.
+
+The sweep only considers posts stored **since the daemon started**. It will not
+work through a historical backlog — that remains `--batch`'s job.
+
 > **Important:** The daemon is a live listener only. It processes messages that arrive while it is running — it does **not** backfill historical posts. Always run `--batch` first to catch up on any posts you want in the briefing, then start the daemon.
 
 > **Warning:** Do not run `--batch` (or `--generate`/`--analyse`) while the daemon is running. Both share one Telegram session file and one SQLite database — running them concurrently can lock the session or the database. Stop the daemon first (`Ctrl+C` or `kill`), run the catch-up command, then restart the daemon.
@@ -421,6 +434,63 @@ Set `generation.share_to_directory` in `config.yaml` to a directory path, and th
 
 ---
 
+## Run modes and analysis profiles
+
+The two ways of analysing posts have opposite constraints:
+
+- **`--batch` / `--since`** processes a whole day at once. A thousand-plus posts
+  have to be analysed in one sitting, so speed decides whether the run finishes.
+- **`--daemon`** watches channels live. Posts trickle in, there is idle time
+  between them, and a slower but better model can be afforded.
+
+An **analysis profile** is a named set of LM Studio settings for one mode.
+`--batch`/`--since` select the `batch` profile, `--daemon` selects `daemon`, and
+`--analysis-profile NAME` overrides either:
+
+```bash
+python -m tg_compiler.main --batch                          # uses the "batch" profile
+python -m tg_compiler.main --daemon                         # uses the "daemon" profile
+python -m tg_compiler.main --daemon --analysis-profile batch  # daemon, but with the fast model
+```
+
+A profile carries **the model and the settings that must accompany it** — token
+budgets, concurrency, context length, batch sizes — because those are
+model-specific. A reasoning model needs a large `analysis_base_tokens` or its
+JSON is truncated mid-deliberation; a small model needs a fraction of that, and
+several large-budget image requests at once will exhaust LM Studio's context.
+Carrying only a model name between modes reliably breaks one of them.
+
+```yaml
+lmstudio:
+  analysis_profiles:
+    batch:
+      model: "mistralai/ministral-3-3b"
+      analysis_base_tokens: 700
+      analysis_max_tokens: 1600
+      max_concurrent_analyses: 4
+      model_context_length: 32768
+    daemon:
+      model: "prism-ml/bonsai-27b"
+      analysis_base_tokens: 9500
+      analysis_max_tokens: 16000
+      max_concurrent_analyses: 1
+      model_context_length: 32768
+      batch_size: 10
+      batch_size_with_images: 3
+```
+
+Omit `analysis_profiles` entirely and both modes use the plain `lmstudio`
+settings, exactly as before. A profile only states what differs; everything else
+is inherited. Naming a profile that doesn't exist with `--analysis-profile` is an
+error; a *mode default* that doesn't exist simply falls back to the plain
+settings.
+
+**Pick a daemon model equal to `synthesis_model` where you can.** If they differ
+and `manage_models` is on, every analysis sweep and every nightly generation
+swaps weights (~16 s per load), which at a 10-minute cadence is pure waste.
+
+---
+
 ## Throughput — choosing an analysis model, batch size and concurrency
 
 Analysis dominates runtime: it touches every scraped post (1,000–1,700 a day on a
@@ -477,6 +547,19 @@ Realistic end-to-end figure for a full day of 1,239 real posts with
 `batch_size: 1` and `max_concurrent_analyses: 4`: **2.6 s/post, ~52 minutes**.
 Microbenchmarks on short text-only posts report ~1.1 s/post; a real day includes
 image posts and long posts, so expect the higher figure.
+
+**A large model cannot keep up post-by-post.** This is why the daemon batches
+rather than analysing each post on arrival:
+
+| | 1,100 posts/day | 1,700 posts/day |
+|---|---|---|
+| bonsai-27b, one post per call (85.8 s/post) | 26 h/day | 40 h/day |
+| bonsai-27b, **batched ×10** (23.1 s/post) | **7 h/day** | 11 h/day |
+
+Channels here produce 750–1,700 posts a day. One at a time, a reasoning model
+needs more hours per day than a day contains and falls permanently behind;
+batched, it fits. So a `daemon` profile using a reasoning model should set
+`batch_size: 10` — the one case where batching earns its cost.
 
 **Model swapping.** With `manage_models: true` the analyzer and synthesiser each
 load their own model at stage entry via the LM Studio Python SDK, unloading the
