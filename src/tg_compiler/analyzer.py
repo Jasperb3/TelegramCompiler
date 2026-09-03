@@ -336,20 +336,31 @@ def _opening_words(text: str, limit: int) -> list[str]:
     return _WORD_RE.findall(text.lower())[:limit]
 
 
-def _opening_matches(opening: str, post: PostRecord) -> bool:
-    """Does the echoed opening actually come from this post?
+def check_opening(opening: str, post: PostRecord) -> str:
+    """Classify a batch item's echoed opening against the post it claims.
+
+    Returns "match", "mismatch", or "absent". The three are genuinely different:
+    a mismatch means the model attributed this analysis to the wrong post, while
+    an absent opening only means the claim could not be checked — conflating them
+    would report a model that ignores the field as one that corrupts data.
 
     Observed on google/gemma-3-4b: a model can drop one post from a batch and
     renumber the rest densely, so every reported index is unique and in range
-    while the analyses are all attached to the wrong posts. Indices alone cannot
-    detect that; only something derived from the post's own text can.
+    while the analyses all describe different posts. Indices alone cannot detect
+    that; only something derived from the post's own text can.
     """
     claimed = _opening_words(opening, BATCH_OPENING_WORDS)
     if not claimed:
-        return False
+        return "absent"
     actual = set(_opening_words(post.text, BATCH_OPENING_WORDS * 3))
     hits = sum(1 for w in claimed if w in actual)
-    return hits >= max(1, round(len(claimed) * BATCH_OPENING_MATCH_RATIO))
+    if hits >= max(1, round(len(claimed) * BATCH_OPENING_MATCH_RATIO)):
+        return "match"
+    return "mismatch"
+
+
+def _opening_matches(opening: str, post: PostRecord) -> bool:
+    return check_opening(opening, post) == "match"
 
 
 def map_batch_results(batch: BatchAnalysis, posts: list[PostRecord]) -> dict[int, PostAnalysis]:
@@ -374,11 +385,19 @@ def map_batch_results(batch: BatchAnalysis, posts: list[PostRecord]) -> dict[int
         if pos in mapped:
             log.warning("Duplicate batch result index %s — keeping the first", item.index)
             continue
-        if not _opening_matches(item.opening, posts[pos]):
+        verdict = check_opening(item.opening, posts[pos])
+        if verdict == "mismatch":
             log.warning(
-                "Batch result %d echoed opening %r, which does not match post %s — dropped "
-                "(the model may have renumbered its results)",
+                "Batch result %d echoed opening %r, which belongs to a different post than "
+                "%s — dropped; the model renumbered its results and cannot be batched safely",
                 item.index, item.opening[:60], posts[pos].message_id,
+            )
+            continue
+        if verdict == "absent":
+            log.warning(
+                "Batch result %d for post %s carried no opening, so it could not be verified "
+                "— dropped and requeued; this model may be ignoring the field",
+                item.index, posts[pos].message_id,
             )
             continue
         mapped[pos] = _sanitize(item)
