@@ -1251,3 +1251,19 @@ def test_check_opening_cannot_verify_a_post_with_almost_no_text():
     # a post with a real body is still checked strictly
     full = _batch_post(2, text="Russia says Ukrainian strikes hit grain infrastructure in Novorossiysk.")
     assert check_opening("Belgium blocks frozen Russian assets today", full) == "mismatch"
+
+
+def test_opening_words_ignores_channel_promo_boilerplate():
+    """A DDGeopolitics image post's whole content was "Estonian Leviathan"; the
+    other sixteen tokens were the channel's @handle and Socials/Donate/Advertising
+    links. Counting those as body text made the post look verifiable when it was
+    not, and produced a false misattribution flag."""
+    from tg_compiler.analyzer import _opening_words, check_opening
+
+    text = (
+        "🇪🇪🇷🇺🤣 Estonian Leviathan\n\n🔴@DDGeopolitics | "
+        "[Socials](https://telegra.ph/Explore-DD-Geopolitics) | "
+        "[Donate](https://ko-fi.com/ddgeo)"
+    )
+    assert _opening_words(text, 18) == ["estonian", "leviathan"]
+    assert check_opening("Russia hates Estonia more than any", _batch_post(1, text=text)) == "absent"
