@@ -216,8 +216,9 @@ BATCH_INSTRUCTIONS = (
     "to each other: analyse each one strictly on its own content, and never carry facts, "
     "entities, figures, or wording from one post into another post's analysis. Return one "
     "object per post in \"analyses\", each carrying that post's 1-based \"index\" exactly as "
-    "given, and \"opening\": the first six words of that post copied verbatim. Return an "
-    "object for every post and nothing else."
+    "given, and \"opening\": the first six words of that post's Text line copied verbatim "
+    "(the words after 'Text:', not the Channel or Time lines). Return an object for every "
+    "post and nothing else."
 )
 
 
@@ -255,7 +256,7 @@ def build_batch_messages(
             "type": "text",
             "text": (
                 f"### POST {i}\nChannel: {post.channel_name}\n"
-                f"Time: {post.timestamp.isoformat()}\n\n{text}"
+                f"Time: {post.timestamp.isoformat()}\nText: {text}"
             ),
         })
         for path in post.media_paths[:cfg.batch_images_per_post]:

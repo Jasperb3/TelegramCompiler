@@ -1140,3 +1140,19 @@ def test_map_batch_results_drops_unverifiable_items_without_calling_them_mismatc
         assert map_batch_results(BatchAnalysis(analyses=[_batch_item(1, opening="")]), posts) == {}
     assert "could not be verified" in caplog.text
     assert "renumbered" not in caplog.text
+
+
+def test_build_batch_messages_labels_the_body_so_the_anchor_is_unambiguous():
+    """The anchor asks for the post's first six words. Observed on
+    mistralai/ministral-3-3b: with an unlabelled body it echoed "Channel
+    GeoPWatch" — the first words of the *block* — which the matcher then read as
+    misattribution. The body must be labelled and the instruction must say so."""
+    from tg_compiler.analyzer import SYSTEM_PROMPT, build_batch_messages
+
+    cfg = _batch_config().lmstudio
+    post = _batch_post(1, text="China extends the commercial truce agreed last October.")
+    messages = build_batch_messages([post], SYSTEM_PROMPT, cfg)
+
+    block = messages[1]["content"][1]["text"]
+    assert "Text: China extends the commercial truce" in block
+    assert "Text:" in messages[0]["content"]
