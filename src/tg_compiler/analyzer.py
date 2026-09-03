@@ -606,8 +606,11 @@ class Analyzer:
             # whole call's work — thousands of tokens — would be thrown away.
             completion = e.completion
         choice = completion.choices[0]
-        if choice.message.parsed is not None:
-            return choice.message.parsed
+        # LengthFinishReasonError carries a plain ChatCompletion, which has no
+        # `parsed` attribute at all — not merely a None one.
+        parsed = getattr(choice.message, "parsed", None)
+        if parsed is not None:
+            return parsed
 
         raw = (choice.message.content or "").strip()
         if raw.startswith("```"):

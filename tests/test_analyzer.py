@@ -1038,12 +1038,20 @@ async def test_analyze_batch_salvages_when_parse_raises_on_length_limit(db):
         '"category": "Analysis", "key_entities": []}, '
         '{"index": 2, "title": "T2", "summ'
     )
-    truncated = SimpleNamespace(
-        choices=[SimpleNamespace(
-            message=SimpleNamespace(parsed=None, content=raw), finish_reason="length",
+    # The real LengthFinishReasonError carries a plain ChatCompletion whose message
+    # has no `parsed` attribute at all, so the fake must not define one either —
+    # a fake with parsed=None hides an AttributeError in the salvage path.
+    from openai.types.chat import ChatCompletion, ChatCompletionMessage
+    from openai.types.chat.chat_completion import Choice
+
+    truncated = ChatCompletion(
+        id="c1", object="chat.completion", created=0, model="test-model",
+        choices=[Choice(
+            index=0, finish_reason="length",
+            message=ChatCompletionMessage(role="assistant", content=raw),
         )],
-        usage=None,
     )
+    assert not hasattr(truncated.choices[0].message, "parsed")
 
     def parse(**_kwargs):
         raise LengthFinishReasonError(completion=truncated)
