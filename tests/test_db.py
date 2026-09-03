@@ -57,6 +57,32 @@ def test_get_unanalysed_posts(db, sample_post):
     assert any(p.id == post_id for p in unanalysed)
 
 
+def test_get_unanalysed_posts_since_excludes_older_posts(db, sample_post):
+    from dataclasses import replace
+
+    old_post = replace(sample_post, message_id=1, timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc))
+    new_post = replace(sample_post, message_id=2, timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc))
+    db.insert_post(old_post)
+    new_id = db.insert_post(new_post)
+
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    unanalysed = db.get_unanalysed_posts(since=cutoff)
+
+    assert [p.id for p in unanalysed] == [new_id]
+
+
+def test_get_unanalysed_posts_since_boundary_inclusive(db, sample_post):
+    from dataclasses import replace
+
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    boundary_post = replace(sample_post, message_id=3, timestamp=cutoff)
+    boundary_id = db.insert_post(boundary_post)
+
+    unanalysed = db.get_unanalysed_posts(since=cutoff)
+
+    assert any(p.id == boundary_id for p in unanalysed)
+
+
 def test_insert_analysis_and_joined_query(db, sample_post):
     post_id = db.insert_post(sample_post)
     rec = AnalysisRecord(

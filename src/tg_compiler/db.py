@@ -182,12 +182,17 @@ class Database:
         )
         self._conn.commit()
 
-    def get_unanalysed_posts(self) -> list[PostRecord]:
-        rows = self._conn.execute(
-            """SELECT p.* FROM posts p
-               LEFT JOIN analyses a ON a.post_id = p.id
-               WHERE a.id IS NULL"""
-        ).fetchall()
+    def get_unanalysed_posts(self, since: datetime | None = None) -> list[PostRecord]:
+        query = """SELECT p.* FROM posts p
+                   LEFT JOIN analyses a ON a.post_id = p.id
+                   WHERE a.id IS NULL"""
+        params: tuple = ()
+        if since is not None:
+            # Timestamps are uniform ISO-8601 UTC strings, so lexicographic
+            # comparison is exact and hits idx_posts_timestamp (SEARCH not SCAN).
+            query += " AND p.timestamp >= ?"
+            params = (since.isoformat(),)
+        rows = self._conn.execute(query, params).fetchall()
         return [_row_to_post(r) for r in rows]
 
     def insert_analysis(self, rec: AnalysisRecord) -> int | None:

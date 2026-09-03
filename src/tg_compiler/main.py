@@ -71,7 +71,7 @@ async def generate_daily_briefing(
     return path, content
 
 
-async def run_batch(config: AppConfig) -> None:
+async def run_batch(config: AppConfig, since_dt: datetime | None = None) -> None:
     from tg_compiler.analyzer import Analyzer
     from tg_compiler.synthesiser import run_analysis
 
@@ -94,7 +94,7 @@ async def run_batch(config: AppConfig) -> None:
         channel_map = scraper.channel_map
 
     analyzer = Analyzer(config, db)
-    analysed_count, skipped_count = await analyzer.process_unanalysed(channel_map)
+    analysed_count, skipped_count = await analyzer.process_unanalysed(channel_map, since=since_dt)
     log.info("Analysed %d posts (skipped %d)", analysed_count, skipped_count)
 
     path, content = await generate_daily_briefing(
@@ -356,7 +356,7 @@ def main() -> None:
             log.info("--since %s: lookback set to %ds, all channel cursors reset", args.since, cfg.telegram.lookback_seconds)
 
     if args.batch:
-        asyncio.run(run_batch(cfg))
+        asyncio.run(run_batch(cfg, since_dt))
     elif args.daemon:
         asyncio.run(run_daemon(cfg))
     elif args.analyse:

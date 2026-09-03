@@ -254,6 +254,65 @@ async def test_process_unanalysed_analyses_short_caption_video_post(db, app_conf
     assert pairs[0][1].category == "Analysis"
 
 
+async def test_process_unanalysed_since_excludes_older_posts(db, app_config, monkeypatch):
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    old_post = PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        text="x" * 50, media_paths=[], has_images=False, raw_json="{}",
+    )
+    new_post = PostRecord(
+        channel_id=1, channel_name="chan", message_id=2,
+        timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc),
+        text="x" * 50, media_paths=[], has_images=False, raw_json="{}",
+    )
+    db.insert_post(old_post)
+    db.insert_post(new_post)
+
+    analyzer = Analyzer(app_config, db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        return _analysis(summary="Real analysis output for a long post.")
+
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    analysed_count, skipped_count = await analyzer.process_unanalysed(since=cutoff)
+    assert (analysed_count, skipped_count) == (1, 0)
+
+    remaining = db.get_unanalysed_posts()
+    assert [p.message_id for p in remaining] == [1]
+
+
+async def test_process_unanalysed_since_logs_excluded_count(db, app_config, monkeypatch, caplog):
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    old_post = PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        text="x" * 50, media_paths=[], has_images=False, raw_json="{}",
+    )
+    db.insert_post(old_post)
+
+    analyzer = Analyzer(app_config, db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+    monkeypatch.setattr(analyzer, "analyze_post", lambda *a, **k: None)
+
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    with caplog.at_level("INFO"):
+        await analyzer.process_unanalysed(since=cutoff)
+
+    assert "1 older unanalysed posts excluded" in caplog.text
+
+
 def test_clean_image_insights_rejects_none_provided():
     assert _clean_image_insights("None provided") is None
     assert _clean_image_insights("none provided.") is None

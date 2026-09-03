@@ -5,6 +5,7 @@ import base64
 import logging
 import math
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -394,14 +395,27 @@ class Analyzer:
             return False
 
     async def process_unanalysed(
-        self, channel_map: dict[int, ChannelConfig] | None = None
+        self,
+        channel_map: dict[int, ChannelConfig] | None = None,
+        since: datetime | None = None,
     ) -> tuple[int, int]:
         """Analyse every unanalysed post up to lmstudio.max_concurrent_analyses in
         parallel, after a preflight reachability probe (aborts with everything left
         queued if LM Studio is down). Posts under MIN_CONTENT_CHARS with no media are
         skipped (recorded with category="Skipped") rather than sent to the LLM.
+        If `since` is given, only posts with timestamp >= since are analysed — older
+        stuck-unanalysed posts are left queued for a future unscoped run.
         Returns (analysed_count, skipped_count)."""
-        posts = self._db.get_unanalysed_posts()
+        posts = self._db.get_unanalysed_posts(since=since)
+        if since is not None:
+            excluded = len(self._db.get_unanalysed_posts()) - len(posts)
+            if excluded:
+                log.info(
+                    "--since filter: %d older unanalysed posts excluded from this run "
+                    "(predate %s), still queued for a future unscoped run",
+                    excluded,
+                    since.isoformat(),
+                )
         if not posts:
             return 0, 0
 

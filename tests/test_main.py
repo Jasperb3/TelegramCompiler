@@ -157,7 +157,7 @@ async def test_run_batch_continues_after_one_channel_fails(tmp_path, batch_confi
         def __init__(self, config, db):
             pass
 
-        async def process_unanalysed(self, channel_map=None):
+        async def process_unanalysed(self, channel_map=None, since=None):
             return 0, 0
 
     async def fake_generate_daily_briefing(config, today, db, **kwargs):
@@ -175,6 +175,52 @@ async def test_run_batch_continues_after_one_channel_fails(tmp_path, batch_confi
     await main_module.run_batch(batch_config)
 
     assert scraped_channels == ["chan_a", "chan_c"]
+
+
+async def test_run_batch_passes_since_dt_to_process_unanalysed(tmp_path, batch_config, monkeypatch):
+    from datetime import datetime, timezone
+
+    batch_config.storage.db_path = str(tmp_path / "db.sqlite")
+
+    class FakeScraper:
+        def __init__(self, config, db):
+            self.channel_map = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def scrape_channel(self, channel_cfg):
+            return []
+
+    received_since = []
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def process_unanalysed(self, channel_map=None, since=None):
+            received_since.append(since)
+            return 0, 0
+
+    async def fake_generate_daily_briefing(config, today, db, **kwargs):
+        from tg_compiler.triage import BriefingContent
+        return "fake.pdf", BriefingContent(date=today, main_items=[], appendix_items=[])
+
+    async def fake_run_analysis(config, today, main_items=None):
+        return None
+
+    monkeypatch.setattr(main_module, "Scraper", FakeScraper)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+    monkeypatch.setattr(main_module, "generate_daily_briefing", fake_generate_daily_briefing)
+    monkeypatch.setattr("tg_compiler.synthesiser.run_analysis", fake_run_analysis)
+
+    since_dt = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    await main_module.run_batch(batch_config, since_dt)
+
+    assert received_since == [since_dt]
 
 
 async def test_run_batch_purges_old_media(tmp_path, batch_config, monkeypatch):
@@ -198,7 +244,7 @@ async def test_run_batch_purges_old_media(tmp_path, batch_config, monkeypatch):
         def __init__(self, config, db):
             pass
 
-        async def process_unanalysed(self, channel_map=None):
+        async def process_unanalysed(self, channel_map=None, since=None):
             return 0, 0
 
     async def fake_generate_daily_briefing(config, today, db, **kwargs):
