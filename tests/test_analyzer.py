@@ -554,3 +554,459 @@ async def test_process_unanalysed_leaves_post_queued_on_analysis_failure(db, app
     assert (analysed_count, skipped_count) == (0, 0)
     # the failed post stays unanalysed so the next run retries it
     assert len(db.get_unanalysed_posts()) == 1
+
+
+# --------------------------------------------------------------------------
+# Batched analysis
+# --------------------------------------------------------------------------
+
+
+def _batch_config(**lm_overrides):
+    from tg_compiler.config import AppConfig, LMStudioConfig, TelegramConfig
+
+    lm = dict(model="test-model")
+    lm.update(lm_overrides)
+    return AppConfig(
+        telegram=TelegramConfig(api_id=1, api_hash="x", channels=[]),
+        lmstudio=LMStudioConfig(**lm),
+    )
+
+
+def _batch_post(message_id, text="A post with enough text to clear the content gate.",
+                media_paths=None, channel_id=1):
+    from datetime import datetime, timezone
+
+    from tg_compiler.db import PostRecord
+
+    return PostRecord(
+        channel_id=channel_id, channel_name="chan", message_id=message_id,
+        timestamp=datetime(2026, 6, 7, 12, 0, tzinfo=timezone.utc),
+        text=text, media_paths=media_paths or [], has_images=bool(media_paths),
+        raw_json="{}",
+    )
+
+
+def _batch_item(index, **overrides):
+    from tg_compiler.analyzer import BatchPostAnalysis
+
+    base = dict(
+        index=index,
+        title=f"Title {index}",
+        summary=f"Summary for post {index}.",
+        importance_score=3, urgency_score=3, credibility_score=3, relevance_score=3,
+        category="Analysis", key_entities=[], reasoning="",
+    )
+    base.update(overrides)
+    return BatchPostAnalysis.model_validate(base)
+
+
+def test_build_batch_messages_numbers_posts_and_interleaves_images(monkeypatch):
+    from tg_compiler.analyzer import SYSTEM_PROMPT, build_batch_messages
+
+    monkeypatch.setattr("tg_compiler.analyzer._encode_image", lambda p: f"B64<{p}>")
+    cfg = _batch_config(batch_images_per_post=1).lmstudio
+    posts = [
+        _batch_post(1, text="first post"),
+        _batch_post(2, text="second post", media_paths=["a.jpg", "b.jpg"]),
+    ]
+
+    messages = build_batch_messages(posts, SYSTEM_PROMPT, cfg)
+
+    assert messages[0]["role"] == "system"
+    assert "analyses" in messages[0]["content"]
+    assert SYSTEM_PROMPT in messages[0]["content"]
+
+    parts = messages[1]["content"]
+    assert "### POST 1" in parts[1]["text"]
+    assert "first post" in parts[1]["text"]
+    assert "### POST 2" in parts[2]["text"]
+    # only one image per post, and it follows its own post's text part
+    assert parts[3]["type"] == "image_url"
+    assert "B64<a.jpg>" in parts[3]["image_url"]["url"]
+    assert len(parts) == 4
+
+
+def test_build_batch_messages_truncates_long_text():
+    from tg_compiler.analyzer import SYSTEM_PROMPT, build_batch_messages
+
+    cfg = _batch_config().lmstudio
+    post = _batch_post(1, text="y" * (MAX_PROMPT_TEXT_CHARS + 500))
+    parts = build_batch_messages([post], SYSTEM_PROMPT, cfg)[1]["content"]
+    assert parts[1]["text"].count("y") == MAX_PROMPT_TEXT_CHARS
+
+
+def test_plan_batches_separates_media_posts_and_honours_sizes():
+    from tg_compiler.analyzer import plan_batches
+
+    cfg = _batch_config(batch_size=3, batch_size_with_images=2).lmstudio
+    text_posts = [_batch_post(i) for i in range(1, 6)]
+    media_posts = [_batch_post(i, media_paths=["x.jpg"]) for i in range(6, 9)]
+
+    batches = plan_batches(text_posts + media_posts, cfg)
+
+    sizes = [len(b) for b in batches]
+    assert sizes == [3, 2, 2, 1]
+    # no batch mixes media and text-only posts
+    for batch in batches:
+        assert len({bool(p.media_paths) for p in batch}) == 1
+
+
+def test_plan_batches_size_one_yields_single_post_batches():
+    from tg_compiler.analyzer import plan_batches
+
+    cfg = _batch_config().lmstudio  # batch_size defaults to 1
+    posts = [_batch_post(i) for i in range(1, 4)]
+    assert [len(b) for b in plan_batches(posts, cfg)] == [1, 1, 1]
+
+
+def test_plan_batches_splits_batch_exceeding_prompt_char_cap():
+    from tg_compiler.analyzer import plan_batches
+
+    cfg = _batch_config(batch_size=10, batch_max_prompt_chars=1000).lmstudio
+    posts = [_batch_post(i, text="z" * 400) for i in range(1, 6)]
+    assert [len(b) for b in plan_batches(posts, cfg)] == [2, 2, 1]
+
+
+def test_batch_token_budget_scales_with_posts_and_clamps():
+    from tg_compiler.analyzer import compute_batch_token_budget
+
+    cfg = _batch_config(
+        batch_base_tokens=1000, batch_tokens_per_post=100,
+        batch_tokens_per_char=0.0, batch_tokens_per_image=50,
+        batch_max_tokens=1250,
+    ).lmstudio
+    assert compute_batch_token_budget([_batch_post(1)], cfg) == 1100
+    assert compute_batch_token_budget([_batch_post(i) for i in (1, 2)], cfg) == 1200
+    # clamped at batch_max_tokens
+    assert compute_batch_token_budget([_batch_post(i) for i in range(10)], cfg) == 1250
+
+
+def test_batch_token_budget_counts_images_up_to_the_per_post_cap():
+    from tg_compiler.analyzer import compute_batch_token_budget
+
+    cfg = _batch_config(
+        batch_base_tokens=1000, batch_tokens_per_post=0,
+        batch_tokens_per_char=0.0, batch_tokens_per_image=50,
+        batch_images_per_post=2, batch_max_tokens=99999,
+    ).lmstudio
+    post = _batch_post(1, media_paths=["a.jpg", "b.jpg", "c.jpg"])
+    assert compute_batch_token_budget([post], cfg) == 1100
+
+
+def test_map_batch_results_maps_by_index_not_position():
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    batch = BatchAnalysis(analyses=[_batch_item(3), _batch_item(1), _batch_item(2)])
+    mapped = map_batch_results(batch, 3)
+    assert set(mapped) == {0, 1, 2}
+    assert mapped[0].summary == "Summary for post 1."
+    assert mapped[2].summary == "Summary for post 3."
+
+
+def test_map_batch_results_drops_out_of_range_index():
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    batch = BatchAnalysis(analyses=[_batch_item(1), _batch_item(9), _batch_item(0)])
+    mapped = map_batch_results(batch, 2)
+    assert set(mapped) == {0}
+
+
+def test_map_batch_results_keeps_first_of_duplicate_indices():
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    batch = BatchAnalysis(analyses=[
+        _batch_item(1, summary="First one wins here."),
+        _batch_item(1, summary="Second one is discarded."),
+    ])
+    mapped = map_batch_results(batch, 2)
+    assert mapped[0].summary == "First one wins here."
+
+
+def test_map_batch_results_omits_positions_the_model_did_not_return():
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    mapped = map_batch_results(BatchAnalysis(analyses=[_batch_item(2)]), 3)
+    assert set(mapped) == {1}
+
+
+def test_map_batch_results_sanitizes_every_item():
+    from tg_compiler.analyzer import BatchAnalysis, map_batch_results
+
+    batch = BatchAnalysis(analyses=[
+        _batch_item(1, summary="Tanks <b>rolled</b> into the city & held it."),
+        _batch_item(2, summary="The user provided no content for analysis."),
+    ])
+    mapped = map_batch_results(batch, 2)
+    assert mapped[0].summary == "Tanks &lt;b&gt;rolled&lt;/b&gt; into the city &amp; held it."
+    assert mapped[1].summary == ""
+
+
+def test_salvage_batch_items_recovers_prefix_of_truncated_response():
+    from tg_compiler.analyzer import salvage_batch_items
+
+    complete = (
+        '{"index": 1, "title": "T1", "summary": "S1", "importance_score": 3, '
+        '"urgency_score": 3, "credibility_score": 3, "relevance_score": 3, '
+        '"category": "Analysis", "key_entities": []}'
+    )
+    raw = '{"analyses": [' + complete + ', {"index": 2, "title": "T2", "sum'
+    salvaged = salvage_batch_items(raw)
+    assert [i.index for i in salvaged.analyses] == [1]
+    assert salvaged.analyses[0].summary == "S1"
+
+
+def test_salvage_batch_items_returns_empty_when_key_absent():
+    from tg_compiler.analyzer import salvage_batch_items
+
+    assert salvage_batch_items("total garbage, no json here").analyses == []
+
+
+def _fake_batch_client(calls, parsed=None, content="", finish_reason="stop"):
+    from types import SimpleNamespace
+
+    completion = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(parsed=parsed, content=content),
+        finish_reason=finish_reason,
+    )])
+
+    def parse(**kwargs):
+        calls.append(kwargs)
+        return completion
+
+    return SimpleNamespace(
+        beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse)))
+    )
+
+
+async def test_analyze_batch_returns_mapping_and_uses_batch_budget(db):
+    from tg_compiler.analyzer import Analyzer, BatchAnalysis
+
+    config = _batch_config(
+        batch_size=2, batch_base_tokens=1000, batch_tokens_per_post=100,
+        batch_tokens_per_char=0.0, batch_tokens_per_image=0, batch_max_tokens=99999,
+    )
+    analyzer = Analyzer(config, db)
+    calls = []
+    analyzer._client = _fake_batch_client(
+        calls, parsed=BatchAnalysis(analyses=[_batch_item(1), _batch_item(2)])
+    )
+
+    results = await analyzer.analyze_batch([_batch_post(1), _batch_post(2)])
+    assert set(results) == {0, 1}
+    assert calls[0]["max_tokens"] == 1200
+
+
+async def test_analyze_batch_salvages_truncated_response(db):
+    from tg_compiler.analyzer import Analyzer
+
+    raw = (
+        '{"analyses": [{"index": 1, "title": "T1", "summary": "S1", '
+        '"importance_score": 3, "urgency_score": 3, "credibility_score": 3, '
+        '"relevance_score": 3, "category": "Analysis", "key_entities": []}, '
+        '{"index": 2, "title": "T2"'
+    )
+    analyzer = Analyzer(_batch_config(batch_size=2), db)
+    analyzer._client = _fake_batch_client([], content=raw, finish_reason="length")
+
+    results = await analyzer.analyze_batch([_batch_post(1), _batch_post(2)])
+    assert set(results) == {0}
+
+
+async def test_analyze_batch_returns_empty_when_call_fails(db, monkeypatch):
+    from tg_compiler import analyzer as analyzer_mod
+    from tg_compiler.analyzer import Analyzer
+
+    monkeypatch.setattr(analyzer_mod, "RETRY_BACKOFF_BASE_SECS", 0)
+    analyzer = Analyzer(_batch_config(batch_size=2), db)
+
+    def boom(*a, **kw):
+        raise RuntimeError("server exploded")
+
+    monkeypatch.setattr(analyzer, "_call_batch_llm", boom)
+    assert await analyzer.analyze_batch([_batch_post(1), _batch_post(2)]) == {}
+
+
+async def test_process_unanalysed_batches_posts_into_one_call(db, monkeypatch):
+    from tg_compiler.analyzer import Analyzer
+
+    for i in range(1, 5):
+        db.insert_post(_batch_post(i))
+
+    analyzer = Analyzer(_batch_config(batch_size=4), db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+    batches = []
+
+    async def fake_analyze_batch(posts):
+        batches.append(list(posts))
+        return {i: _analysis(summary=f"Batched summary {i}.") for i in range(len(posts))}
+
+    monkeypatch.setattr(analyzer, "analyze_batch", fake_analyze_batch)
+
+    analysed, skipped = await analyzer.process_unanalysed()
+    assert (analysed, skipped) == (4, 0)
+    assert [len(b) for b in batches] == [4]
+    assert db.get_unanalysed_posts() == []
+
+
+async def test_process_unanalysed_batch_size_one_uses_single_post_path(db, monkeypatch):
+    from tg_compiler.analyzer import Analyzer
+
+    db.insert_post(_batch_post(1))
+    analyzer = Analyzer(_batch_config(), db)  # batch_size defaults to 1
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_batch(posts):  # pragma: no cover - must never run
+        raise AssertionError("batch path used despite batch_size == 1")
+
+    seen = []
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        seen.append(post.message_id)
+        return _analysis()
+
+    monkeypatch.setattr(analyzer, "analyze_batch", fake_analyze_batch)
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    assert await analyzer.process_unanalysed() == (1, 0)
+    assert seen == [1]
+
+
+async def test_process_unanalysed_low_yield_batch_falls_back_to_single_calls(db, monkeypatch):
+    from tg_compiler.analyzer import Analyzer
+
+    for i in range(1, 5):
+        db.insert_post(_batch_post(i))
+
+    analyzer = Analyzer(_batch_config(batch_size=4, batch_min_yield_ratio=0.6), db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_batch(posts):
+        return {0: _analysis(summary="Only the first came back.")}
+
+    retried = []
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        retried.append(post.message_id)
+        return _analysis(summary="Recovered by the single-post path.")
+
+    monkeypatch.setattr(analyzer, "analyze_batch", fake_analyze_batch)
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    analysed, _ = await analyzer.process_unanalysed()
+    assert sorted(retried) == [2, 3, 4]
+    assert analysed == 4
+    assert db.get_unanalysed_posts() == []
+
+
+async def test_process_unanalysed_high_yield_batch_leaves_stragglers_queued(db, monkeypatch):
+    from tg_compiler.analyzer import Analyzer
+
+    for i in range(1, 5):
+        db.insert_post(_batch_post(i))
+
+    analyzer = Analyzer(_batch_config(batch_size=4, batch_min_yield_ratio=0.6), db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_batch(posts):
+        return {i: _analysis() for i in range(3)}  # post 4 missing
+
+    async def fake_analyze_post(post, channel_cfg=None):  # pragma: no cover
+        raise AssertionError("single-post fallback ran on a high-yield batch")
+
+    monkeypatch.setattr(analyzer, "analyze_batch", fake_analyze_batch)
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    analysed, _ = await analyzer.process_unanalysed()
+    assert analysed == 3
+    assert [p.message_id for p in db.get_unanalysed_posts()] == [4]
+
+
+async def test_process_unanalysed_skips_short_posts_before_batching(db, monkeypatch):
+    from tg_compiler.analyzer import Analyzer
+
+    db.insert_post(_batch_post(1, text="ok"))          # below MIN_CONTENT_CHARS
+    db.insert_post(_batch_post(2))
+    db.insert_post(_batch_post(3))
+
+    analyzer = Analyzer(_batch_config(batch_size=4), db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+    batched = []
+
+    async def fake_analyze_batch(posts):
+        batched.extend(p.message_id for p in posts)
+        return {i: _analysis() for i in range(len(posts))}
+
+    monkeypatch.setattr(analyzer, "analyze_batch", fake_analyze_batch)
+
+    analysed, skipped = await analyzer.process_unanalysed()
+    assert (analysed, skipped) == (2, 1)
+    assert batched == [2, 3]
+    pairs = db.get_days_posts_with_analyses("2026-06-07")
+    assert {p.message_id: a.category for p, a in pairs}[1] == "Skipped"
+
+
+async def test_process_unanalysed_keeps_custom_prompt_posts_out_of_batches(db, monkeypatch):
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.config import ChannelConfig
+
+    db.insert_post(_batch_post(1, channel_id=1))
+    db.insert_post(_batch_post(2, channel_id=2))
+    db.insert_post(_batch_post(3, channel_id=2))
+
+    analyzer = Analyzer(_batch_config(batch_size=4), db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+    channel_map = {
+        1: ChannelConfig(slug="special", custom_prompt="Be different"),
+        2: ChannelConfig(slug="normal"),
+    }
+    batched, singled = [], []
+
+    async def fake_analyze_batch(posts):
+        batched.extend(p.message_id for p in posts)
+        return {i: _analysis() for i in range(len(posts))}
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        singled.append((post.message_id, channel_cfg.slug if channel_cfg else None))
+        return _analysis()
+
+    monkeypatch.setattr(analyzer, "analyze_batch", fake_analyze_batch)
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    analysed, _ = await analyzer.process_unanalysed(channel_map)
+    assert analysed == 3
+    assert batched == [2, 3]
+    assert singled == [(1, "special")]
+
+
+async def test_process_unanalysed_since_filter_applies_under_batching(db, monkeypatch):
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    old = PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        text="An older post with plenty of text in it.", media_paths=[],
+        has_images=False, raw_json="{}",
+    )
+    db.insert_post(old)
+    db.insert_post(_batch_post(2))
+    db.insert_post(_batch_post(3))
+
+    analyzer = Analyzer(_batch_config(batch_size=4), db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+    batched = []
+
+    async def fake_analyze_batch(posts):
+        batched.extend(p.message_id for p in posts)
+        return {i: _analysis() for i in range(len(posts))}
+
+    monkeypatch.setattr(analyzer, "analyze_batch", fake_analyze_batch)
+
+    analysed, _ = await analyzer.process_unanalysed(
+        since=datetime(2026, 6, 5, tzinfo=timezone.utc)
+    )
+    assert analysed == 2
+    assert batched == [2, 3]
+    assert [p.message_id for p in db.get_unanalysed_posts()] == [1]

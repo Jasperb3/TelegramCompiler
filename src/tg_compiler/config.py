@@ -49,6 +49,22 @@ class LMStudioConfig(BaseModel):
     analysis_max_tokens: int = Field(default=4000, gt=0)         # hard ceiling on any single analysis call
     synthesis_max_tokens: int = 24000  # token budget for the intel front-page synthesis (large: reasoning models deliberate before emitting JSON)
     max_concurrent_analyses: int = 1  # parallel LLM calls; increase if LM Studio can handle it
+    # Batched analysis (see analyzer.plan_batches / analyze_batch). Several posts go
+    # into one LLM call, which amortises the mostly per-call reasoning burn across
+    # them. Both sizes default to 1 = one post per call = the pre-batching path.
+    batch_size: int = Field(default=1, ge=1)              # text-only posts per LLM call
+    batch_size_with_images: int = Field(default=1, ge=1)  # media-bearing posts per LLM call
+    batch_images_per_post: int = Field(default=1, ge=1)   # images attached per post in a batch
+    #   budget = min(batch_base_tokens + posts * batch_tokens_per_post
+    #                + text_chars * batch_tokens_per_char
+    #                + images * batch_tokens_per_image, batch_max_tokens)
+    batch_base_tokens: int = Field(default=2000, gt=0)      # flat shared reasoning allowance per batch call
+    batch_tokens_per_post: int = Field(default=400, ge=0)   # per-post JSON output allowance
+    batch_tokens_per_char: float = Field(default=0.3, ge=0)  # per character of batched prompt text
+    batch_tokens_per_image: int = Field(default=400, ge=0)   # per image attached in a batch
+    batch_max_tokens: int = Field(default=32000, gt=0)      # hard ceiling on any batch call
+    batch_max_prompt_chars: int = Field(default=24000, gt=0)  # split a batch whose prompt text exceeds this
+    batch_min_yield_ratio: float = Field(default=0.6, ge=0.0, le=1.0)  # below this, retry the batch's posts singly
 
     @model_validator(mode="after")
     def _validate_analysis_budget_bounds(self) -> "LMStudioConfig":
@@ -56,6 +72,11 @@ class LMStudioConfig(BaseModel):
             raise ValueError(
                 f"analysis_base_tokens ({self.analysis_base_tokens}) must be <= "
                 f"analysis_max_tokens ({self.analysis_max_tokens})"
+            )
+        if self.batch_base_tokens > self.batch_max_tokens:
+            raise ValueError(
+                f"batch_base_tokens ({self.batch_base_tokens}) must be <= "
+                f"batch_max_tokens ({self.batch_max_tokens})"
             )
         return self
 

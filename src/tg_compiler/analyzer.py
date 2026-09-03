@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import math
 import re
@@ -72,6 +73,7 @@ MAX_IMAGES_PER_POST = 3       # at most this many images are attached per post's
 ANALYSIS_MAX_ATTEMPTS = 3     # analyze_post's structured-output retry ladder
 RETRY_BACKOFF_BASE_SECS = 10  # backoff = RETRY_BACKOFF_BASE_SECS * (attempt + 1)
 PREFLIGHT_TIMEOUT_SECS = 10   # LM Studio reachability probe timeout before process_unanalysed runs
+BATCH_MAX_ATTEMPTS = 2        # a failed batch falls back to per-post calls, so don't retry it for long
 
 
 class PostAnalysis(BaseModel):
@@ -207,6 +209,170 @@ def compute_token_budget(post: PostRecord, cfg: LMStudioConfig) -> int:
         + n_images * cfg.analysis_tokens_per_image
     )
     return min(budget, cfg.analysis_max_tokens)
+
+
+BATCH_INSTRUCTIONS = (
+    "\n\nYou will be given several numbered posts in a single message. The posts are unrelated "
+    "to each other: analyse each one strictly on its own content, and never carry facts, "
+    "entities, figures, or wording from one post into another post's analysis. Return one "
+    "object per post in \"analyses\", each carrying that post's 1-based \"index\" exactly as "
+    "given. Return an object for every post and nothing else."
+)
+
+
+class BatchPostAnalysis(PostAnalysis):
+    """A PostAnalysis carrying the 1-based position of the post it describes."""
+
+    index: int
+
+
+class BatchAnalysis(BaseModel):
+    analyses: list[BatchPostAnalysis] = Field(default_factory=list)
+
+
+def build_batch_messages(
+    posts: list[PostRecord], system_prompt: str, cfg: LMStudioConfig
+) -> list[dict]:
+    """One multimodal user message holding every post in the batch.
+
+    Each post is a "### POST n" text part followed immediately by its images, so
+    the model can tell which image belongs to which post. Text is truncated with
+    the same MAX_PROMPT_TEXT_CHARS cap build_messages uses.
+    """
+    content: list[dict] = [
+        {"type": "text", "text": f"Analyse each of the following {len(posts)} posts."}
+    ]
+    for i, post in enumerate(posts, 1):
+        text = post.text[:MAX_PROMPT_TEXT_CHARS]
+        content.append({
+            "type": "text",
+            "text": (
+                f"### POST {i}\nChannel: {post.channel_name}\n"
+                f"Time: {post.timestamp.isoformat()}\n\n{text}"
+            ),
+        })
+        for path in post.media_paths[:cfg.batch_images_per_post]:
+            b64 = _encode_image(path)
+            if b64:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                })
+
+    return [
+        {"role": "system", "content": system_prompt + BATCH_INSTRUCTIONS},
+        {"role": "user", "content": content},
+    ]
+
+
+def _chunk(posts: list[PostRecord], size: int, max_chars: int) -> list[list[PostRecord]]:
+    """Split posts into runs of at most `size`, closing a run early if its prompt
+    text would exceed `max_chars` — a run of long posts must not overflow context."""
+    batches: list[list[PostRecord]] = []
+    current: list[PostRecord] = []
+    chars = 0
+    for post in posts:
+        n = min(len(post.text), MAX_PROMPT_TEXT_CHARS)
+        if current and (len(current) >= size or chars + n > max_chars):
+            batches.append(current)
+            current, chars = [], 0
+        current.append(post)
+        chars += n
+    if current:
+        batches.append(current)
+    return batches
+
+
+def plan_batches(posts: list[PostRecord], cfg: LMStudioConfig) -> list[list[PostRecord]]:
+    """Group posts into LLM calls.
+
+    Media-bearing posts are grouped separately and at their own (smaller) size:
+    images dominate the prompt, so they amortise far less per extra post than
+    text-only ones do. With both sizes at their default of 1 every batch is a
+    single post, which process_unanalysed routes down the per-post path.
+    """
+    text_posts = [p for p in posts if not p.media_paths]
+    media_posts = [p for p in posts if p.media_paths]
+    return (
+        _chunk(text_posts, cfg.batch_size, cfg.batch_max_prompt_chars)
+        + _chunk(media_posts, cfg.batch_size_with_images, cfg.batch_max_prompt_chars)
+    )
+
+
+def compute_batch_token_budget(posts: list[PostRecord], cfg: LMStudioConfig) -> int:
+    """max_tokens for one batch call.
+
+    Same shape as compute_token_budget, but the reasoning allowance is a single
+    flat base for the whole call rather than per post — that shared deliberation
+    is exactly what batching amortises:
+
+        min(base + posts * per_post + text_chars * per_char + images * per_image, max)
+    """
+    text_chars = sum(min(len(p.text), MAX_PROMPT_TEXT_CHARS) for p in posts)
+    n_images = sum(min(len(p.media_paths), cfg.batch_images_per_post) for p in posts)
+    budget = (
+        cfg.batch_base_tokens
+        + len(posts) * cfg.batch_tokens_per_post
+        + math.ceil(text_chars * cfg.batch_tokens_per_char)
+        + n_images * cfg.batch_tokens_per_image
+    )
+    return min(budget, cfg.batch_max_tokens)
+
+
+def map_batch_results(batch: BatchAnalysis, batch_size: int) -> dict[int, PostAnalysis]:
+    """Map returned analyses onto batch positions by their reported `index`.
+
+    Never by list position — a model that drops or reorders an item would
+    otherwise silently attach an analysis to the wrong post. Out-of-range and
+    duplicate indices are dropped and logged; a position with no result is simply
+    absent from the returned dict, leaving that post unanalysed.
+    """
+    mapped: dict[int, PostAnalysis] = {}
+    for item in batch.analyses:
+        pos = item.index - 1
+        if not 0 <= pos < batch_size:
+            log.warning(
+                "Batch result index %s outside 1..%d — dropped", item.index, batch_size
+            )
+            continue
+        if pos in mapped:
+            log.warning("Duplicate batch result index %s — keeping the first", item.index)
+            continue
+        mapped[pos] = _sanitize(item)
+    return mapped
+
+
+def salvage_batch_items(raw: str) -> BatchAnalysis:
+    """Recover the complete analysis objects from a truncated batch response.
+
+    A response cut off at max_tokens is invalid JSON as a whole, but the objects
+    emitted before the cut are intact and worth keeping — the posts they cover
+    don't need re-analysing.
+    """
+    start = raw.find('"analyses"')
+    if start == -1:
+        return BatchAnalysis()
+    start = raw.find("[", start)
+    if start == -1:
+        return BatchAnalysis()
+
+    decoder = json.JSONDecoder()
+    items: list[BatchPostAnalysis] = []
+    pos = start + 1
+    while pos < len(raw):
+        while pos < len(raw) and raw[pos] in ", \n\r\t":
+            pos += 1
+        if pos >= len(raw) or raw[pos] != "{":
+            break
+        try:
+            obj, pos = decoder.raw_decode(raw, pos)
+        except ValueError:
+            break
+        try:
+            items.append(BatchPostAnalysis.model_validate(obj))
+        except Exception:
+            continue
+    return BatchAnalysis(analyses=items)
 
 
 _NUM_RE = re.compile(r'\b(\d+(?:\.\d+)?)\b')
@@ -381,6 +547,62 @@ class Analyzer:
                     return _sanitize(parse_analysis_fallback(result if isinstance(result, str) else ""))
                 await asyncio.sleep(RETRY_BACKOFF_BASE_SECS * (attempt + 1))
 
+    def _call_batch_llm(self, messages: list[dict], max_tokens: int, expected: int) -> BatchAnalysis:
+        cfg = self._cfg.lmstudio
+        completion = self._get_client().beta.chat.completions.parse(
+            model=cfg.model,
+            messages=messages,
+            response_format=BatchAnalysis,
+            temperature=cfg.temperature,
+            max_tokens=max_tokens,
+        )
+        choice = completion.choices[0]
+        if choice.message.parsed is not None:
+            return choice.message.parsed
+
+        raw = (choice.message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            return BatchAnalysis.model_validate_json(raw)
+        except Exception:
+            # A response cut off at max_tokens is unparseable as a whole; keep the
+            # objects that made it out and let the caller requeue the rest.
+            salvaged = salvage_batch_items(raw)
+            log.warning(
+                "Batch response was not valid JSON (finish_reason=%s) — salvaged %d of %d items",
+                choice.finish_reason, len(salvaged.analyses), expected,
+            )
+            return salvaged
+
+    async def analyze_batch(self, posts: list[PostRecord]) -> dict[int, PostAnalysis]:
+        """Analyse several posts in one LLM call.
+
+        Returns {position in `posts`: PostAnalysis} for the posts the model
+        actually returned. Positions absent from the result were not analysed —
+        the caller decides whether to retry them individually or requeue them.
+        Returns {} if the call fails outright.
+        """
+        messages = build_batch_messages(posts, SYSTEM_PROMPT, self._cfg.lmstudio)
+        budget = compute_batch_token_budget(posts, self._cfg.lmstudio)
+
+        last_error: Exception | None = None
+        for attempt in range(BATCH_MAX_ATTEMPTS):
+            try:
+                result = await asyncio.to_thread(
+                    self._call_batch_llm, messages, budget, len(posts)
+                )
+                return map_batch_results(result, len(posts))
+            except Exception as e:
+                last_error = e
+                if attempt < BATCH_MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(RETRY_BACKOFF_BASE_SECS * (attempt + 1))
+        log.warning(
+            "Batch of %d posts failed after %d attempts: %s",
+            len(posts), BATCH_MAX_ATTEMPTS, last_error,
+        )
+        return {}
+
     def _server_reachable(self) -> bool:
         """Quick preflight probe so a dead LM Studio aborts in seconds, not hours."""
         try:
@@ -423,17 +645,28 @@ class Analyzer:
             log.error("Aborting analysis — %d posts remain queued for the next run", len(posts))
             return 0, 0
 
-        sem = asyncio.Semaphore(self._cfg.lmstudio.max_concurrent_analyses)
+        cfg = self._cfg.lmstudio
+        sem = asyncio.Semaphore(cfg.max_concurrent_analyses)
         skipped = 0
-        failed = 0
+        analysed = 0
 
         from tqdm import tqdm
         from tqdm.contrib.logging import logging_redirect_tqdm
 
         bar = tqdm(total=len(posts), desc="Analysing posts", unit="post")
 
-        async def _analyse_and_save(post: PostRecord) -> None:
-            nonlocal skipped, failed
+        def _channel_cfg(post: PostRecord) -> ChannelConfig | None:
+            return channel_map.get(post.channel_id) if channel_map else None
+
+        def _save(post: PostRecord, analysis: PostAnalysis) -> None:
+            nonlocal analysed
+            self._db.insert_analysis(analysis_to_record(post.id, analysis, cfg.model))
+            analysed += 1
+
+        # Content gate first, so short no-media posts never reach the LLM — batched
+        # or not — and are recorded as "Skipped" exactly as before.
+        to_analyse: list[PostRecord] = []
+        for post in posts:
             if (
                 len(post.text.strip()) < MIN_CONTENT_CHARS
                 and not post.media_paths
@@ -449,31 +682,74 @@ class Analyzer:
                     relevance_score=None,
                     category="Skipped",
                     key_entities=[],
-                    model_used=self._cfg.lmstudio.model,
+                    model_used=cfg.model,
                 ))
                 skipped += 1
                 bar.update(1)
-                return
-            channel_cfg = channel_map.get(post.channel_id) if channel_map else None
+            else:
+                to_analyse.append(post)
+
+        async def _analyse_one(post: PostRecord) -> None:
             try:
                 async with sem:
-                    analysis = await self.analyze_post(post, channel_cfg)
+                    analysis = await self.analyze_post(post, _channel_cfg(post))
             except Exception as e:
                 log.error(
                     "Analysis failed for post %s — left unanalysed for the next run: %s",
                     post.message_id, e,
                 )
-                failed += 1
                 bar.update(1)
                 return
-            self._db.insert_analysis(analysis_to_record(post.id, analysis, self._cfg.lmstudio.model))
+            _save(post, analysis)
             bar.update(1)
+
+        async def _analyse_batch(batch: list[PostRecord]) -> None:
+            if len(batch) == 1:
+                await _analyse_one(batch[0])
+                return
+            async with sem:
+                results = await self.analyze_batch(batch)
+            for pos in sorted(results):
+                _save(batch[pos], results[pos])
+            bar.update(len(results))
+
+            missing = [p for i, p in enumerate(batch) if i not in results]
+            if not missing:
+                return
+            if len(results) < cfg.batch_min_yield_ratio * len(batch):
+                # A mostly-failed batch signals something systematic (context
+                # overflow, a malformed response) — fall back to the per-post path.
+                log.warning(
+                    "Batch of %d returned only %d analyses — retrying the other %d individually",
+                    len(batch), len(results), len(missing),
+                )
+                await asyncio.gather(*(_analyse_one(p) for p in missing))
+            else:
+                log.info(
+                    "%d of %d batched posts were not returned — left queued for the next run",
+                    len(missing), len(batch),
+                )
+                bar.update(len(missing))
+
+        # A channel with a custom_prompt needs its own system prompt, which a shared
+        # batch call cannot provide — those posts stay on the per-post path.
+        custom_ids = {
+            p.id for p in to_analyse
+            if (_channel_cfg(p) is not None and _channel_cfg(p).custom_prompt)
+        }
+        custom_posts = [p for p in to_analyse if p.id in custom_ids]
+        batchable = [p for p in to_analyse if p.id not in custom_ids]
 
         with logging_redirect_tqdm():
             try:
-                await asyncio.gather(*(_analyse_and_save(p) for p in posts))
+                await asyncio.gather(
+                    *(_analyse_batch(b) for b in plan_batches(batchable, cfg)),
+                    *(_analyse_one(p) for p in custom_posts),
+                )
             finally:
                 bar.close()
+
+        failed = len(to_analyse) - analysed
         if failed:
             log.warning("%d posts failed analysis and remain queued for the next run", failed)
-        return len(posts) - skipped - failed, skipped
+        return analysed, skipped
