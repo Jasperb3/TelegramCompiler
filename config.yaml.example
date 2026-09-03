@@ -41,6 +41,10 @@ lmstudio:
   # 191 s/post). Images amortise far less (they dominate the prompt), hence the
   # separate, smaller size for media-bearing posts. Both sizes at 1 = one post per
   # call = the original behaviour.
+  # Only worth raising above 1 for a *reasoning* analysis model, whose per-call
+  # deliberation is what batching amortises. For a non-reasoning model a batch of
+  # 10 measured 1.7x faster while producing 36% shorter summaries and 36% fewer
+  # entities — see the Throughput section of README.md.
   batch_size: 1                     # text-only posts per LLM call
   batch_size_with_images: 1         # media-bearing posts per LLM call
   batch_images_per_post: 1          # images attached per post inside a batch
