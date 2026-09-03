@@ -156,6 +156,7 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int,
                 "importance": item.importance_score, "urgency": item.urgency_score,
                 "credibility": item.credibility_score, "relevance": item.relevance_score,
                 "key_entities": item.key_entities,
+                "image_description": item.image_description or "",
             })
 
     n = len(posts)
@@ -167,6 +168,22 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int,
         "prompt_tokens": prompt_t, "completion_tokens": completion_t,
         "reasoning_per_post": reasoning_t / n if n else 0.0,
         "finish_reasons": finishes, "analyses": analyses,
+    }
+
+
+def richness(analyses: list[dict]) -> dict:
+    """How much substance each analysis carries.
+
+    Coverage and agreement can both look fine while batched summaries quietly get
+    shorter and lose entities or image insight, so measure that directly.
+    """
+    if not analyses:
+        return {"summary_chars": 0.0, "entities": 0.0, "image_rate": 0.0}
+    n = len(analyses)
+    return {
+        "summary_chars": sum(len(a["summary"]) for a in analyses) / n,
+        "entities": sum(len(a["key_entities"]) for a in analyses) / n,
+        "image_rate": sum(1 for a in analyses if a.get("image_description")) / n,
     }
 
 
@@ -264,6 +281,13 @@ def main() -> None:
                 print(f"  {c['model']} @ batch {c['batch_size']}: "
                       f"category {cmp['category_agreement']:.0%}, "
                       f"threat {cmp['threat_agreement']:.0%}, |Δ| {deltas}")
+
+    print("\n| model | batch | coverage | mean summary chars | mean entities | image-insight rate |")
+    print("|---|---|---|---|---|---|")
+    for c in cells:
+        r = richness(c["analyses"])
+        print(f"| {c['model']} | {c['batch_size']} | {c['returned']}/{c['posts']} | "
+              f"{r['summary_chars']:.0f} | {r['entities']:.1f} | {r['image_rate']:.0%} |")
 
     bad = [c for c in cells if c["misattributed"]]
     if bad:
