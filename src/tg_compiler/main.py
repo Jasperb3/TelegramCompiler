@@ -233,14 +233,12 @@ async def run_daemon(config: AppConfig) -> None:
                 log.warning("Received message from unmapped channel %s — skipping", channel_id)
                 return
             record = await build_post_record(client, msg, channel_id, channel_cfg, config.storage)
-            post_id = db.insert_post(record)
+            db.insert_post(record)  # returns None on duplicate; the sweep picks it up either way
             # Advance the per-channel cursor so a later --batch resumes from here
             # instead of re-walking everything the daemon already captured. Guard
             # with max() so out-of-order live events never rewind it.
             if msg.id > db.get_last_seen_id(channel_id):
                 db.set_last_seen_id(channel_id, msg.id)
-            if post_id is not None:
-                record.id = post_id
             stored_count += 1
             log.debug("Stored post %s from %s", msg.id, channel_cfg.slug)
 
