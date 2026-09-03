@@ -28,6 +28,9 @@ from openai import OpenAI  # noqa: E402
 from tg_compiler import analyzer as A  # noqa: E402
 from tg_compiler.config import load_config  # noqa: E402
 from tg_compiler.db import Database  # noqa: E402
+from tg_compiler.models import ModelManager  # noqa: E402
+
+SCORES = ("importance", "urgency", "credibility", "relevance")
 
 SAMPLE_FILE = Path(__file__).with_name("bench_sample.json")
 SAMPLE_SEED = 20260903
@@ -71,10 +74,21 @@ def _usage(completion) -> tuple[int, int, int]:
     return u.prompt_tokens, u.completion_tokens, reasoning
 
 
-def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
-    """Analyse `posts` at the given batch size and report timing and tokens."""
+def run_cell(client, cfg, model: str, posts: list, batch_size: int,
+             manager: ModelManager | None = None) -> dict:
+    """Analyse `posts` at the given batch size and report timing and tokens.
+
+    Candidate models generally cannot co-reside in VRAM, so a manager is needed to
+    make each one resident before its cells run; load time is reported separately
+    from inference time so it never distorts s/post.
+    """
     cfg = cfg.model_copy(update={"model": model, "batch_size": batch_size,
                                  "batch_size_with_images": batch_size})
+    load_secs = 0.0
+    if manager is not None:
+        started = time.time()
+        manager.ensure(model)
+        load_secs = time.time() - started
     batches = A.plan_batches(posts, cfg)
     wall = prompt_t = completion_t = reasoning_t = 0.0
     returned = 0
@@ -131,9 +145,38 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
     return {
         "model": model, "batch_size": batch_size, "posts": n, "returned": returned,
         "wall": wall, "s_per_post": wall / n if n else 0.0,
+        "load_secs": load_secs,
         "prompt_tokens": prompt_t, "completion_tokens": completion_t,
         "reasoning_per_post": reasoning_t / n if n else 0.0,
         "finish_reasons": finishes, "analyses": analyses,
+    }
+
+
+def compare_analyses(reference: list[dict], candidate: list[dict]) -> dict | None:
+    """Agreement between two runs' analyses of the same posts.
+
+    Used both to check a candidate model against a reference model and to check
+    batched output against single-call output. Returns None when the two runs
+    share no posts.
+    """
+    a = {r["message_id"]: r for r in reference}
+    b = {r["message_id"]: r for r in candidate}
+    common = sorted(set(a) & set(b))
+    if not common:
+        return None
+    return {
+        "posts": len(common),
+        "category_agreement": sum(a[i]["category"] == b[i]["category"] for i in common) / len(common),
+        "threat_agreement": sum(
+            a[i]["threat_level"] == b[i]["threat_level"] for i in common
+        ) / len(common),
+        "score_deltas": {
+            s: sum(abs(a[i][s] - b[i][s]) for i in common) / len(common) for s in SCORES
+        },
+        "empty_summaries": {
+            "reference": sum(not a[i]["summary"].strip() for i in common),
+            "candidate": sum(not b[i]["summary"].strip() for i in common),
+        },
     }
 
 
@@ -147,6 +190,8 @@ def main() -> None:
     ap.add_argument("--with-images", action="store_true",
                     help="benchmark the image sample instead of the text sample")
     ap.add_argument("--out", default="", help="write the raw per-cell JSON here")
+    ap.add_argument("--reference", default="",
+                    help="model id to treat as the quality reference for agreement")
     args = ap.parse_args()
 
     config = load_config(args.config)
@@ -163,19 +208,43 @@ def main() -> None:
     client = OpenAI(base_url=f"http://{lm.server_host}:{lm.server_port}/v1",
                     api_key=lm.api_token or "lm-studio", timeout=3600, max_retries=0)
 
+    # Model management is what makes a multi-model benchmark possible at all:
+    # candidates rarely fit in VRAM together, so each must be made resident in turn.
+    manage = lm.model_copy(update={"manage_models": True})
     cells = []
-    for model in args.models.split(","):
-        for size in (int(s) for s in args.batch_sizes.split(",")):
-            print(f"running {model} @ batch {size} over {len(posts)} posts…", file=sys.stderr)
-            cells.append(run_cell(client, lm, model.strip(), posts, size))
+    with ModelManager(manage) as manager:
+        for model in args.models.split(","):
+            for size in (int(s) for s in args.batch_sizes.split(",")):
+                print(f"running {model} @ batch {size} over {len(posts)} posts…",
+                      file=sys.stderr)
+                cells.append(run_cell(client, lm, model.strip(), posts, size, manager))
 
     print(f"\n{len(posts)} posts, {'with images' if args.with_images else 'text-only'}\n")
-    print("| model | batch | s/post | returned | reasoning tok/post | completion tok | finish |")
-    print("|---|---|---|---|---|---|---|")
+    print("| model | batch | s/post | load s | returned | reasoning tok/post | completion tok | finish |")
+    print("|---|---|---|---|---|---|---|---|")
     for c in cells:
         print(f"| {c['model']} | {c['batch_size']} | {c['s_per_post']:.1f} | "
-              f"{c['returned']}/{c['posts']} | {c['reasoning_per_post']:.0f} | "
-              f"{c['completion_tokens']:.0f} | {c['finish_reasons']} |")
+              f"{c['load_secs']:.0f} | {c['returned']}/{c['posts']} | "
+              f"{c['reasoning_per_post']:.0f} | {c['completion_tokens']:.0f} | "
+              f"{c['finish_reasons']} |")
+
+    if args.reference:
+        ref = next((c for c in cells if c["model"] == args.reference), None)
+        if ref is None:
+            print(f"\nreference model {args.reference} was not benchmarked", file=sys.stderr)
+        else:
+            print(f"\nagreement against {args.reference}:")
+            for c in cells:
+                if c is ref:
+                    continue
+                cmp = compare_analyses(ref["analyses"], c["analyses"])
+                if cmp is None:
+                    print(f"  {c['model']} @ {c['batch_size']}: no shared posts")
+                    continue
+                deltas = " ".join(f"{k[:4]} {v:.2f}" for k, v in cmp["score_deltas"].items())
+                print(f"  {c['model']} @ batch {c['batch_size']}: "
+                      f"category {cmp['category_agreement']:.0%}, "
+                      f"threat {cmp['threat_agreement']:.0%}, |Δ| {deltas}")
 
     if len(cells) > 1:
         best = min(cells, key=lambda c: c["s_per_post"])

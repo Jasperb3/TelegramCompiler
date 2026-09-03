@@ -1010,3 +1010,85 @@ async def test_process_unanalysed_since_filter_applies_under_batching(db, monkey
     assert analysed == 2
     assert batched == [2, 3]
     assert [p.message_id for p in db.get_unanalysed_posts()] == [1]
+
+
+# --------------------------------------------------------------------------
+# Per-stage models
+# --------------------------------------------------------------------------
+
+
+def test_call_llm_addresses_the_configured_analysis_model(db):
+    from tg_compiler.analyzer import Analyzer
+
+    config = _batch_config(analysis_model="small-model", synthesis_model="reasoning-model")
+    analyzer = Analyzer(config, db)
+    calls = []
+    analyzer._client = _fake_openai_client(calls, parsed=_analysis())
+
+    analyzer._call_llm([{"role": "user", "content": "hi"}], structured=True, max_tokens=100)
+    assert calls[0][1]["model"] == "small-model"
+
+
+async def test_batch_call_addresses_the_configured_analysis_model(db):
+    from tg_compiler.analyzer import Analyzer, BatchAnalysis
+
+    config = _batch_config(batch_size=2, analysis_model="small-model")
+    analyzer = Analyzer(config, db)
+    calls = []
+    analyzer._client = _fake_batch_client(
+        calls, parsed=BatchAnalysis(analyses=[_batch_item(1), _batch_item(2)])
+    )
+
+    await analyzer.analyze_batch([_batch_post(1), _batch_post(2)])
+    assert calls[0]["model"] == "small-model"
+
+
+async def test_process_unanalysed_makes_the_analysis_model_resident(db, monkeypatch):
+    from tg_compiler import analyzer as analyzer_mod
+    from tg_compiler.analyzer import Analyzer
+
+    db.insert_post(_batch_post(1))
+    ensured = []
+
+    class FakeManager:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def ensure(self, model_key):
+            ensured.append(model_key)
+
+    monkeypatch.setattr(analyzer_mod, "ModelManager", FakeManager)
+
+    analyzer = Analyzer(_batch_config(analysis_model="small-model"), db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        return _analysis()
+
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    await analyzer.process_unanalysed()
+    assert ensured == ["small-model"]
+
+
+async def test_analysis_row_records_the_analysis_model(db, monkeypatch):
+    from tg_compiler.analyzer import Analyzer
+
+    db.insert_post(_batch_post(1))
+    analyzer = Analyzer(_batch_config(analysis_model="small-model"), db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        return _analysis()
+
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+    await analyzer.process_unanalysed()
+
+    pairs = db.get_days_posts_with_analyses("2026-06-07")
+    assert pairs[0][1].model_used == "small-model"

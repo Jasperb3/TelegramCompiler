@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from tg_compiler.config import AppConfig, ChannelConfig, LMStudioConfig
 from tg_compiler.db import AnalysisRecord, Database, PostRecord
+from tg_compiler.models import ModelManager
 from tg_compiler.utils import _ENTITY_GARBAGE, clean_entities, escape_html
 
 log = logging.getLogger(__name__)
@@ -486,7 +487,7 @@ class Analyzer:
         client = self._get_client()
         if structured:
             completion = client.beta.chat.completions.parse(
-                model=cfg.model,
+                model=cfg.model_for("analysis"),
                 messages=messages,
                 response_format=PostAnalysis,
                 temperature=cfg.temperature,
@@ -499,7 +500,7 @@ class Analyzer:
             raw = completion.choices[0].message.content or ""
         else:
             completion = client.chat.completions.create(
-                model=cfg.model,
+                model=cfg.model_for("analysis"),
                 messages=messages,
                 temperature=cfg.temperature,
                 max_tokens=max_tokens,
@@ -550,7 +551,7 @@ class Analyzer:
     def _call_batch_llm(self, messages: list[dict], max_tokens: int, expected: int) -> BatchAnalysis:
         cfg = self._cfg.lmstudio
         completion = self._get_client().beta.chat.completions.parse(
-            model=cfg.model,
+            model=cfg.model_for("analysis"),
             messages=messages,
             response_format=BatchAnalysis,
             temperature=cfg.temperature,
@@ -649,6 +650,9 @@ class Analyzer:
             return 0, 0
 
         cfg = self._cfg.lmstudio
+        with ModelManager(cfg) as manager:
+            await asyncio.to_thread(manager.ensure, cfg.model_for("analysis"))
+
         sem = asyncio.Semaphore(cfg.max_concurrent_analyses)
         skipped = 0
         analysed = 0
@@ -663,7 +667,9 @@ class Analyzer:
 
         def _save(post: PostRecord, analysis: PostAnalysis) -> None:
             nonlocal analysed
-            self._db.insert_analysis(analysis_to_record(post.id, analysis, cfg.model))
+            self._db.insert_analysis(
+                analysis_to_record(post.id, analysis, cfg.model_for("analysis"))
+            )
             analysed += 1
 
         # Content gate first, so short no-media posts never reach the LLM — batched
@@ -685,7 +691,7 @@ class Analyzer:
                     relevance_score=None,
                     category="Skipped",
                     key_entities=[],
-                    model_used=cfg.model,
+                    model_used=cfg.model_for("analysis"),
                 ))
                 skipped += 1
                 bar.update(1)

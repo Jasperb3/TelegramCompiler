@@ -415,3 +415,42 @@ async def test_run_analysis_accepts_main_items_kwarg():
     })
     # Empty main_items — should log error and return without crashing
     await run_analysis(cfg, date(2026, 6, 9), main_items=[])
+
+
+async def test_synthesise_addresses_the_configured_synthesis_model(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from tg_compiler import synthesiser as synth_mod
+    from tg_compiler.config import AppConfig, LMStudioConfig, TelegramConfig
+
+    intel = {
+        "situation_summary": "A quiet day with little movement across the theatres.",
+        "key_themes": [{"theme": "T", "detail": "D", "sources": [1]}],
+        "signals_and_warnings": [{"signal": "S", "assessment": "A", "sources": [1]}],
+        "named_actors": [{"actor": "A", "role": "R", "activity": "X"}],
+    }
+    calls = []
+
+    def fake_openai(**_kwargs):
+        def create(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(intel)), finish_reason="stop",
+            )])
+
+        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+    monkeypatch.setattr(synth_mod, "OpenAI", fake_openai)
+
+    config = AppConfig(
+        telegram=TelegramConfig(api_id=1, api_hash="x", channels=[]),
+        lmstudio=LMStudioConfig(
+            model="fallback-model", analysis_model="small-model",
+            synthesis_model="reasoning-model",
+        ),
+    )
+    result = await synth_mod.synthesise(config, [{"index": 1, "summary": "s"}])
+
+    assert result is not None
+    assert calls[0]["model"] == "reasoning-model"

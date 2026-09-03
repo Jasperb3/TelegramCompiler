@@ -54,6 +54,19 @@ lmstudio:
   batch_max_tokens: 32000           # hard ceiling on any batch call
   batch_max_prompt_chars: 24000     # split a batch whose prompt text would exceed this
   batch_min_yield_ratio: 0.6        # if a batch returns less than this fraction, retry its posts one by one
+  # Per-stage models. Analysis scores every scraped post and wants a small, fast,
+  # non-reasoning VLM; synthesis runs once over the whole triaged day and is where
+  # reasoning actually earns its cost. Both fall back to `model` when unset.
+  # analysis_model: "mistralai/ministral-3-3b"
+  # synthesis_model: "prism-ml/bonsai-27b"
+  # With manage_models on, the LM Studio SDK loads each stage's model at the stage
+  # boundary and unloads the previous one — necessary when the models cannot
+  # co-reside in VRAM (a 27B leaves ~4 GB free on a 16 GB card). It fails loudly
+  # if the SDK cannot reach LM Studio.
+  manage_models: false              # opt in to SDK-driven load/unload between stages
+  unload_others: true               # unload other loaded LLMs before loading a stage's model
+  model_ttl_seconds: 3600           # LM Studio unloads an idle model after this, so a crashed run strands nothing
+  # model_context_length: 32768     # optional load-time context override
 
 triage:
   keywords: ["urgent", "breaking", "launch"]  # words that add keyword_boost to a post's score

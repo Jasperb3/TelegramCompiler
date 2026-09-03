@@ -16,6 +16,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "pypdf>=4.0",
     "tqdm>=4.66",
+    "lmstudio>=1.5",
 ]
 
 [project.optional-dependencies]

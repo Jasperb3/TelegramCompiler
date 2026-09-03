@@ -17,15 +17,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from bench_analysis import load_sample, run_cell  # noqa: E402
+from bench_analysis import compare_analyses, load_sample, run_cell  # noqa: E402
 from openai import OpenAI  # noqa: E402
 
 from tg_compiler import analyzer as A  # noqa: E402
 from tg_compiler.config import load_config  # noqa: E402
 from tg_compiler.db import Database  # noqa: E402
 from tg_compiler.utils import normalize_entity  # noqa: E402
-
-SCORES = ("importance", "urgency", "credibility", "relevance")
 
 
 def count_leaked_entities(analyses: list[dict], posts: list, cfg) -> tuple[int, int]:
@@ -85,41 +83,31 @@ def main() -> None:
     print(f"batched at {args.batch_size}…", file=sys.stderr)
     batched = run_cell(client, lm, lm.model, posts, args.batch_size)
 
-    a = {r["message_id"]: r for r in single["analyses"]}
-    b = {r["message_id"]: r for r in batched["analyses"]}
-    common = sorted(set(a) & set(b))
-    if not common:
+    agreement = compare_analyses(single["analyses"], batched["analyses"])
+    if agreement is None:
         sys.exit("No posts were analysed by both runs — nothing to compare.")
-
-    cat = sum(a[i]["category"] == b[i]["category"] for i in common) / len(common)
-    threat = sum(a[i]["threat_level"] == b[i]["threat_level"] for i in common) / len(common)
-    deltas = {
-        s: sum(abs(a[i][s] - b[i][s]) for i in common) / len(common) for s in SCORES
-    }
-    empty_single = sum(not a[i]["summary"].strip() for i in common)
-    empty_batched = sum(not b[i]["summary"].strip() for i in common)
 
     batch_cfg = lm.model_copy(update={"batch_size": args.batch_size,
                                       "batch_size_with_images": args.batch_size})
     leak_b, total_b = count_leaked_entities(batched["analyses"], posts, batch_cfg)
     leak_a, total_a = count_leaked_entities(single["analyses"], posts, batch_cfg)
 
-    print(f"\nsingle vs batch({args.batch_size}) over {len(common)} posts analysed by both")
-    print(f"  coverage        : single {len(a)}/{len(posts)}, batched {len(b)}/{len(posts)}")
+    empty = agreement["empty_summaries"]
+    print(f"\nsingle vs batch({args.batch_size}) over {agreement['posts']} posts analysed by both")
+    print(f"  coverage        : single {len(single['analyses'])}/{len(posts)}, "
+          f"batched {len(batched['analyses'])}/{len(posts)}")
     print(f"  speed           : {single['s_per_post']:.1f} → {batched['s_per_post']:.1f} s/post "
           f"({single['s_per_post'] / max(batched['s_per_post'], 1e-9):.1f}x)")
-    print(f"  category agree  : {cat:.0%}")
-    print(f"  threat agree    : {threat:.0%}")
-    for s in SCORES:
-        print(f"  |Δ {s:<12}: {deltas[s]:.2f}")
-    print(f"  empty summaries : single {empty_single}, batched {empty_batched}")
+    print(f"  category agree  : {agreement['category_agreement']:.0%}")
+    print(f"  threat agree    : {agreement['threat_agreement']:.0%}")
+    for name, delta in agreement["score_deltas"].items():
+        print(f"  |Δ {name:<12}: {delta:.2f}")
+    print(f"  empty summaries : single {empty['reference']}, batched {empty['candidate']}")
     print(f"  entity leakage  : batched {leak_b}/{total_b}, single (control) {leak_a}/{total_a}")
 
     if args.out:
         Path(args.out).write_text(json.dumps(
-            {"single": single, "batched": batched,
-             "category_agreement": cat, "threat_agreement": threat,
-             "score_deltas": deltas,
+            {"single": single, "batched": batched, "agreement": agreement,
              "leakage": {"batched": [leak_b, total_b], "single": [leak_a, total_a]}},
             indent=1,
         ))

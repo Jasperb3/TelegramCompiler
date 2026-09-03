@@ -252,7 +252,11 @@ async def run_daemon(config: AppConfig) -> None:
                     try:
                         async with analysis_sem:
                             analysis = await analyzer.analyze_post(record, channel_cfg)
-                        db.insert_analysis(analysis_to_record(post_id, analysis, config.lmstudio.model))
+                        db.insert_analysis(
+                            analysis_to_record(
+                                post_id, analysis, config.lmstudio.model_for("analysis")
+                            )
+                        )
                         last_probe_failure = None
                         analysed = True
                     except Exception as e:

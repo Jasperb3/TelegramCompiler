@@ -65,6 +65,24 @@ class LMStudioConfig(BaseModel):
     batch_max_tokens: int = Field(default=32000, gt=0)      # hard ceiling on any batch call
     batch_max_prompt_chars: int = Field(default=24000, gt=0)  # split a batch whose prompt text exceeds this
     batch_min_yield_ratio: float = Field(default=0.6, ge=0.0, le=1.0)  # below this, retry the batch's posts singly
+    # Per-stage models (see models.ModelManager). Analysis scores ~1,200 posts a day
+    # and wants a fast non-reasoning model; synthesis runs once over the whole
+    # triaged day and is where reasoning earns its cost. Either falls back to
+    # `model` when unset, so a single-model setup needs none of these.
+    analysis_model: str | None = None
+    synthesis_model: str | None = None
+    manage_models: bool = False        # opt in to SDK-driven load/unload at stage boundaries
+    unload_others: bool = True         # free VRAM by unloading other LLMs before loading a stage's model
+    model_ttl_seconds: int = Field(default=3600, gt=0)  # SDK TTL, so a crashed run can't strand a model
+    model_context_length: int | None = Field(default=None, gt=0)  # load-time context override
+
+    def model_for(self, stage: str) -> str:
+        """The model key for a pipeline stage, falling back to `model`.
+
+        One helper for every call site so the fallback rule can't drift between
+        the analyzer and the synthesiser.
+        """
+        return getattr(self, f"{stage}_model", None) or self.model
 
     @model_validator(mode="after")
     def _validate_analysis_budget_bounds(self) -> "LMStudioConfig":
