@@ -111,6 +111,13 @@ def _clean_title(title: str) -> str:
     return title
 
 
+_NO_EXTRA_INFO_RE = re.compile(
+    r"no (?:additional|new|further|extra) (?:substantive )?(?:information|details|detail|context)"
+    r"|adds? nothing|nothing (?:new|substantive|further)"
+    r"|no (?:substantive )?information beyond"
+)
+
+
 def _clean_image_insights(text: str | None) -> str | None:
     if not text:
         return None
@@ -126,6 +133,10 @@ def _clean_image_insights(text: str | None) -> str | None:
         or 'text-only announcement' in low
         or 'text-based report' in low
         or 'featuring a text' in low
+        # Descriptions whose content is "there is nothing extra here" — the model
+        # answering the image_substantive question in prose instead of the flag.
+        # They render an "Image" line in the briefing that tells the reader nothing.
+        or _NO_EXTRA_INFO_RE.search(low)
     ):
         return None
     if len(stripped) < 10:

@@ -1267,3 +1267,25 @@ def test_opening_words_ignores_channel_promo_boilerplate():
     )
     assert _opening_words(text, 18) == ["estonian", "leviathan"]
     assert check_opening("Russia hates Estonia more than any", _batch_post(1, text=text)) == "absent"
+
+
+@pytest.mark.parametrize("description", [
+    "The image is a screenshot of the tweet, but no additional substantive information beyond the text is provided.",
+    "The image shows a screenshot next to a profile picture, confirming attribution but no new substantive detail.",
+    "A photo that adds nothing to the reported text.",
+    "The picture provides no further context.",
+])
+def test_clean_image_insights_rejects_descriptions_that_say_there_is_nothing_extra(description):
+    """mistralai/ministral-3-3b answers the image_substantive question in prose
+    rather than only via the flag. Rendered, these produce an "Image" line in the
+    briefing that tells the reader nothing."""
+    assert _clean_image_insights(description) is None
+
+
+@pytest.mark.parametrize("description", [
+    "The image shows live demolition explosions destroying buildings in Bint Jbeil.",
+    "The map depicts warmer temperatures over northern latitudes and wetter zones on the west coast.",
+    "Protest signs read 'Make Russia Pay for Their Terrorism' and 'Euroclear We Are Watching You'.",
+])
+def test_clean_image_insights_keeps_substantive_descriptions(description):
+    assert _clean_image_insights(description) == description
