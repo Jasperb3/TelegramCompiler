@@ -47,10 +47,13 @@ lmstudio:
   #   budget = min(batch_base_tokens + posts * batch_tokens_per_post
   #                + text_chars * batch_tokens_per_char
   #                + images * batch_tokens_per_image, batch_max_tokens)
-  batch_base_tokens: 2000           # flat reasoning allowance shared by the whole call
-  batch_tokens_per_post: 400        # JSON output allowance per post in the batch
+  # Sized from measurement: a batch of 10 text posts spent 9,364 completion tokens
+  # on prism-ml/bonsai-27b, a batch of 3 image posts 7,668. Too small a budget shows
+  # up as finish_reason='length' and a partially salvaged batch in the logs.
+  batch_base_tokens: 4000           # flat reasoning allowance shared by the whole call
+  batch_tokens_per_post: 600        # JSON output allowance per post in the batch
   batch_tokens_per_char: 0.3        # extra budget per character of batched prompt text
-  batch_tokens_per_image: 400       # extra budget per image attached in a batch
+  batch_tokens_per_image: 1200      # extra budget per image attached in a batch
   batch_max_tokens: 32000           # hard ceiling on any batch call
   batch_max_prompt_chars: 24000     # split a batch whose prompt text would exceed this
   batch_min_yield_ratio: 0.6        # if a batch returns less than this fraction, retry its posts one by one

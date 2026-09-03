@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from openai import OpenAI  # noqa: E402
+from openai import LengthFinishReasonError, OpenAI  # noqa: E402
 
 from tg_compiler import analyzer as A  # noqa: E402
 from tg_compiler.config import load_config  # noqa: E402
@@ -98,6 +98,12 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
                 model=model, messages=messages, response_format=schema,
                 temperature=cfg.temperature, max_tokens=budget,
             )
+        except LengthFinishReasonError as e:
+            # .parse() raises rather than returning a response cut off at
+            # max_tokens; keep it so the cell reports what actually came back.
+            completion = e.completion
+            print(f"  batch of {len(batch)} hit the token limit — salvaging",
+                  file=sys.stderr)
         except Exception as e:
             print(f"  batch of {len(batch)} failed: {e}", file=sys.stderr)
             continue
@@ -111,6 +117,8 @@ def run_cell(client, cfg, model: str, posts: list, batch_size: int) -> dict:
         finishes[choice.finish_reason] = finishes.get(choice.finish_reason, 0) + 1
 
         parsed = choice.message.parsed
+        if parsed is None and not single:
+            parsed = A.salvage_batch_items(choice.message.content or "")
         if parsed is None:
             continue
         items = [parsed] if single else list(parsed.analyses)
