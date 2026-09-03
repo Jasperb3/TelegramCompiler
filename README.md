@@ -606,6 +606,119 @@ Tests use in-memory SQLite and do not require Telegram credentials or a running 
 
 ---
 
+## Inspecting the database
+
+The pipeline's own output — the PDF — is already triaged and filtered. To look at what the
+analysis stage actually produced, browse `data/briefing.db` directly with
+[Datasette](https://datasette.io/), an optional dev dependency:
+
+```bash
+source .venv/bin/activate
+pip install -e ".[inspect]"                                    # one-off, ~15 pure-Python packages
+
+datasette data/briefing.db \
+  -m scripts/datasette_metadata.yaml \
+  --plugins-dir scripts/datasette_plugins
+# then open http://localhost:8001
+```
+
+WSL2 forwards `localhost`, so a browser on the Windows side reaches it with no extra flags.
+
+**This cannot corrupt or modify the database.** Datasette opens the file through a
+`file:...?mode=ro` SQLite URI and additionally rejects any statement that is not a `SELECT`,
+so it is safe to browse while `--batch` or `--daemon` is writing — WAL readers and the
+writer do not block each other, and you see committed data live.
+
+> **Never pass `-i` / `--immutable` against `data/briefing.db`.** That flag asserts to SQLite
+> that the file will never change, which is false during a run, and yields incorrect reads
+> rather than a clean error. It is only legitimate against a snapshot (see below).
+
+`scripts/datasette_metadata.yaml` sets up faceted browsing (channel on `posts`; category,
+threat level and model on `analyses`) plus these canned queries, linked from the database page:
+
+| Query | What it answers |
+|---|---|
+| `analysed_posts` | The denormalised analysis-with-source-post join. Filter by channel, date and threat level; blank fields are ignored. |
+| `threat_by_channel` | Threat-level mix and mean scores per channel. |
+| `category_counts` | Category distribution, including how much the content gate marks `Skipped`. |
+| `score_distribution` | Histogram across all four scoring axes. |
+| `model_comparison` | Output richness per `model_used` — summary length, entity count, image-insight rate — over production output rather than a benchmark sample. |
+| `unanalysed_backlog` | Posts with no `analyses` row, by day and channel. |
+| `recent_leads` | CRITICAL / HIGH items from the last N days (default 7). |
+| `intel_history` | The stored per-day synthesised assessments. |
+
+The configuration adds no views, tables or indexes — nothing for `init_schema()` to collide with.
+
+Four plugins ship with the `inspect` extra and load automatically:
+
+| Plugin | What it adds |
+|---|---|
+| `datasette-media` | Serves the scraped images at `/-/media/photo/<post id>`. |
+| `datasette-json-html` | Turns a JSON cell into real HTML — inline thumbnails and clickable links. |
+| `datasette-pretty-json` | Formats the four JSON columns (`key_entities`, `media_paths`, `raw_json`, `intel_json`). |
+| `datasette-vega` | Point-and-click charts on any query result, from dropdowns above the table. |
+
+The payoff is the **`image_review`** query: a thumbnail of each scraped image beside the
+model's own `image_insights` for it, so image-analysis quality can be judged at a glance.
+4,194 analysed posts qualify; the query shows the 50 most recent, because images are served
+at full size (~143 KB each) rather than resized.
+
+Two things worth knowing:
+
+- **Run Datasette from the project root.** `media_paths` stores paths relative to it
+  (`data/media/...`), and `datasette-media` opens them as given.
+- **`posts.channel_name` is the slug, not the Telegram username** — they differ for 7 of the
+  16 channels (`WarFrontWitness` → `wfwitness`, `RerumNovarum` → `rnintel`, …). Building a
+  `t.me/<channel_name>/...` link in SQL therefore produces dead links. Use the
+  `tme_link(slug, message_id)` SQL function instead: `scripts/datasette_plugins/channel_links.py`
+  registers it, backed by `AppConfig.channel_link_map()` so it cannot drift from `config.yaml`.
+  It returns `NULL` for a channel with no configured username, and the viewer still starts if
+  `config.yaml` is missing.
+
+`datasette-vega` is unmaintained (last release 2018) but bundles vega-lite offline and only
+injects static assets, so it works fine here. If a future Datasette upgrade ever breaks it,
+drop it from the `inspect` extra — nothing else depends on it.
+
+### Stopping it — the "Stop server" button
+
+`scripts/datasette_plugins/shutdown_button.py` adds a red **Stop server** button to the
+bottom-right of every page. It asks for confirmation, then shuts Datasette down gracefully:
+uvicorn finishes in-flight requests, closes connections, and the `datasette` command exits 0,
+returning your terminal to a prompt. `Ctrl-C` in the terminal does the same thing.
+
+The database is never at risk — Datasette holds only `mode=ro` connections, so there is
+nothing to flush or roll back. `pragma integrity_check` returns `ok` afterwards.
+
+The endpoint that does this (`POST /-/shutdown`) stops a process, so it is guarded three ways:
+POST only, CSRF-checked by Datasette's own middleware, and refused unless the request's `Host`
+is loopback — so the button is inert if you ever bind to a public interface with `-h 0.0.0.0`.
+
+**On closing the browser tab:** the button tries, but browsers only permit a page to close
+itself when a script opened that window in the first place. A tab you opened by typing the URL
+will not close — Chrome and Firefox both block it. So instead of silently failing, the page
+replaces itself with a "Datasette has stopped" panel telling you the tab is now safe to close
+with `Ctrl+W`. If you want genuine one-click closing, launch the UI from a script-opened
+window; there is no way to get it from a normally-opened tab.
+
+For heavy exploratory queries, work from a snapshot instead of the live file. `.backup` is an
+online, WAL-safe copy, and `--immutable` is safe (and faster) on the copy:
+
+```bash
+sqlite3 data/briefing.db ".backup /tmp/briefing-snap.db"
+datasette -i /tmp/briefing-snap.db -m scripts/datasette_metadata.yaml
+```
+
+A cold first run of `unanalysed_backlog` scans all posts and can brush against Datasette's
+default 1-second query limit; add `--setting sql_time_limit_ms 8000` if you hit it.
+
+For a quick one-off without the UI, the same read-only guarantee applies to the CLI:
+
+```bash
+sqlite3 -box "file:data/briefing.db?mode=ro" "select count(*) from analyses;"
+```
+
+---
+
 ## Project layout
 
 For a module-by-module breakdown of the pipeline (`scraper.py`, `analyzer.py`, `triage.py`, `generator.py`, `synthesiser.py`, `trends.py`, `db.py`, etc.) and the data-flow contracts between them, see [`CLAUDE.md`](./CLAUDE.md).
