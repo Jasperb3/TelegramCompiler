@@ -352,7 +352,14 @@ def check_opening(opening: str, post: PostRecord) -> str:
     claimed = _opening_words(opening, BATCH_OPENING_WORDS)
     if not claimed:
         return "absent"
-    actual = set(_opening_words(post.text, BATCH_OPENING_WORDS * 3))
+    actual_words = _opening_words(post.text, BATCH_OPENING_WORDS * 3)
+    if len(actual_words) < BATCH_OPENING_WORDS:
+        # Nothing to match against. Image posts often carry a two-word caption with
+        # the substance inside the picture, and the model then echoes what it read
+        # from the image — a correct analysis the anchor cannot confirm. Claiming
+        # misattribution here would assert corruption we have no evidence for.
+        return "absent"
+    actual = set(actual_words)
     hits = sum(1 for w in claimed if w in actual)
     if hits >= max(1, round(len(claimed) * BATCH_OPENING_MATCH_RATIO)):
         return "match"

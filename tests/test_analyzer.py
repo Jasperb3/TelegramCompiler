@@ -1156,3 +1156,18 @@ def test_build_batch_messages_labels_the_body_so_the_anchor_is_unambiguous():
     block = messages[1]["content"][1]["text"]
     assert "Text: China extends the commercial truce" in block
     assert "Text:" in messages[0]["content"]
+
+
+def test_check_opening_cannot_verify_a_post_with_almost_no_text():
+    """Observed on an image post whose whole body was "Estonian Leviathan": the
+    substance was in the picture, so the model echoed text it read from the image.
+    The analysis was correct; a text anchor simply cannot confirm it, and calling
+    that a mismatch would assert corruption on no evidence."""
+    from tg_compiler.analyzer import check_opening
+
+    caption_only = _batch_post(1, text="Estonian Leviathan")
+    assert check_opening("Russia hates Estonia more than any", caption_only) == "absent"
+
+    # a post with a real body is still checked strictly
+    full = _batch_post(2, text="Russia says Ukrainian strikes hit grain infrastructure in Novorossiysk.")
+    assert check_opening("Belgium blocks frozen Russian assets today", full) == "mismatch"
