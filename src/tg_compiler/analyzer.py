@@ -194,6 +194,22 @@ def _encode_image(path: str) -> str | None:
         return None
 
 
+def _images_were_sent(post: PostRecord, cap: int) -> bool:
+    """Whether any image actually reached the model for this post.
+
+    Videos are never downloaded and a text-only post carries nothing, so without
+    this the model is free to invent what a picture "shows" from the post text
+    alone — measured at 71 fabricated descriptions in a 1,230-post run, 68 of
+    them on video posts, each rendered in the briefing as an observed Image line.
+    Only the first `cap` paths are attached (MAX_IMAGES_PER_POST per post, or
+    batch_images_per_post in a batch), so anything past the cap was never sent.
+    File existence rather than a re-encode: purge_old_media() deletes media the
+    post still references, and re-reading every image to check would double an
+    analysis run's I/O. A file that exists but fails to decode is the one gap,
+    and _encode_image() already logs that."""
+    return any(Path(p).exists() for p in post.media_paths[:cap])
+
+
 def _has_usable_media(post: PostRecord) -> bool:
     """Whether the post still carries media the model can actually see.
 
@@ -421,7 +437,9 @@ def _opening_matches(opening: str, post: PostRecord) -> bool:
     return check_opening(opening, post) == "match"
 
 
-def map_batch_results(batch: BatchAnalysis, posts: list[PostRecord]) -> dict[int, PostAnalysis]:
+def map_batch_results(
+    batch: BatchAnalysis, posts: list[PostRecord], images_per_post: int = MAX_IMAGES_PER_POST
+) -> dict[int, PostAnalysis]:
     """Map returned analyses onto batch positions by their reported `index`.
 
     Never by list position — a model that drops or reorders an item would
@@ -458,7 +476,7 @@ def map_batch_results(batch: BatchAnalysis, posts: list[PostRecord]) -> dict[int
                 item.index, posts[pos].message_id,
             )
             continue
-        mapped[pos] = _sanitize(item)
+        mapped[pos] = _sanitize(item, _images_were_sent(posts[pos], images_per_post))
     return mapped
 
 
@@ -639,13 +657,21 @@ _REFUSAL_RE = re.compile(
 )
 
 
-def _sanitize(analysis: PostAnalysis) -> PostAnalysis:
+def _sanitize(analysis: PostAnalysis, images_sent: bool = True) -> PostAnalysis:
     analysis.title = _clean_title(analysis.title)
     if _REFUSAL_RE.search(analysis.title):
         analysis.title = ""
     if _REFUSAL_RE.search(analysis.summary):
         analysis.summary = ""
     analysis.key_entities = clean_entities(analysis.key_entities)
+    if not images_sent and analysis.image_description:
+        log.info(
+            "Discarding image description for post %r: no image was sent to the model",
+            analysis.title or analysis.summary[:60],
+        )
+        analysis.image_description = None
+        analysis.image_substantive = False
+
     reject_reason = _image_reject_reason(analysis.image_description)
     # Silent when the model neither claimed a substantive image nor returned any
     # text: that is the correct outcome for a text-only post, and logging it
@@ -772,13 +798,16 @@ class Analyzer:
         )
         messages = build_messages(post, system)
         budget = compute_token_budget(post, self._cfg.lmstudio)
+        images_sent = _images_were_sent(post, MAX_IMAGES_PER_POST)
 
         for attempt in range(ANALYSIS_MAX_ATTEMPTS):
             try:
                 result = await asyncio.to_thread(self._call_llm, messages, True, budget)
                 if isinstance(result, PostAnalysis):
-                    return _sanitize(result)
-                return _sanitize(parse_analysis_fallback(result if isinstance(result, str) else ""))
+                    return _sanitize(result, images_sent)
+                return _sanitize(
+                    parse_analysis_fallback(result if isinstance(result, str) else ""), images_sent
+                )
             except Exception as e:
                 if attempt == ANALYSIS_MAX_ATTEMPTS - 1:
                     log.warning(
@@ -790,8 +819,10 @@ class Analyzer:
                     # post as analysed and it would never be retried.
                     result = await asyncio.to_thread(self._call_llm, messages, False, budget)
                     if isinstance(result, PostAnalysis):
-                        return _sanitize(result)
-                    return _sanitize(parse_analysis_fallback(result if isinstance(result, str) else ""))
+                        return _sanitize(result, images_sent)
+                    return _sanitize(
+                        parse_analysis_fallback(result if isinstance(result, str) else ""), images_sent
+                    )
                 await asyncio.sleep(RETRY_BACKOFF_BASE_SECS * (attempt + 1))
 
     def _call_batch_llm(self, messages: list[dict], max_tokens: int, expected: int) -> BatchAnalysis:
@@ -851,7 +882,7 @@ class Analyzer:
                 result = await asyncio.to_thread(
                     self._call_batch_llm, messages, budget, len(posts)
                 )
-                return map_batch_results(result, posts)
+                return map_batch_results(result, posts, self._cfg.lmstudio.batch_images_per_post)
             except Exception as e:
                 last_error = e
                 if attempt < BATCH_MAX_ATTEMPTS - 1:

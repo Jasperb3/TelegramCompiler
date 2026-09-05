@@ -203,6 +203,92 @@ def test_sanitize_keeps_the_description_on_a_numeric_mismatch(caplog):
     assert "Numeric mismatch" in caplog.text
 
 
+def test_images_were_sent_is_false_for_a_video_post_and_a_purged_path(tmp_path):
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import _images_were_sent
+    from tg_compiler.db import PostRecord
+
+    def post(**kw):
+        base = dict(channel_id=1, channel_name="chan", message_id=1,
+                    timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                    text="x" * 50, media_paths=[], has_images=False, raw_json="{}")
+        return PostRecord(**{**base, **kw})
+
+    assert _images_were_sent(post(has_video=True), 3) is False
+    assert _images_were_sent(
+        post(media_paths=[str(tmp_path / "gone.jpg")], has_images=True), 3
+    ) is False
+
+    present = tmp_path / "there.jpg"
+    present.write_bytes(b"jpeg")
+    assert _images_were_sent(post(media_paths=[str(present)], has_images=True), 3) is True
+
+
+def test_images_were_sent_respects_the_image_cap(tmp_path):
+    """Only the first `cap` paths are attached, so a file past the cap was never sent."""
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import _images_were_sent
+    from tg_compiler.db import PostRecord
+
+    beyond = tmp_path / "fourth.jpg"
+    beyond.write_bytes(b"jpeg")
+    post = PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc), text="x" * 50,
+        media_paths=[str(tmp_path / f"missing{i}.jpg") for i in range(3)] + [str(beyond)],
+        has_images=True, raw_json="{}",
+    )
+
+    assert _images_were_sent(post, 3) is False
+    assert _images_were_sent(post, 4) is True
+
+
+def test_sanitize_discards_a_description_when_no_image_was_sent(caplog):
+    """Videos are never downloaded, so a "the video shows..." description is
+    invented from the post text and would render as an observed Image line."""
+    analysis = _analysis(summary="An explosion was reported in Khan Yunis.")
+    analysis.image_substantive = True
+    analysis.image_description = "The image shows a large plume of smoke rising over Khan Yunis."
+
+    with caplog.at_level("INFO"):
+        cleaned = _sanitize(analysis, images_sent=False)
+
+    assert cleaned.image_description is None
+    assert cleaned.image_substantive is False
+    assert "no image was sent" in caplog.text
+
+
+def test_sanitize_keeps_the_description_when_an_image_was_sent():
+    analysis = _analysis(summary="An explosion was reported in Khan Yunis.")
+    analysis.image_description = "The image shows a large plume of smoke rising over Khan Yunis."
+
+    assert _sanitize(analysis, images_sent=True).image_description is not None
+
+
+async def test_analyze_post_discards_the_description_for_a_video_post(db, app_config, monkeypatch):
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    post = PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        text="An explosion was reported in Khan Yunis this morning.",
+        media_paths=[], has_images=False, has_video=True, raw_json="{}",
+    )
+
+    analyzer = Analyzer(app_config, db)
+    fabricated = _analysis(summary="An explosion was reported in Khan Yunis.")
+    fabricated.image_substantive = True
+    fabricated.image_description = "The video shows a plume of smoke over Khan Yunis."
+    monkeypatch.setattr(analyzer, "_call_llm", lambda *a, **k: fabricated)
+
+    assert (await analyzer.analyze_post(post)).image_description is None
+
+
 def test_sanitize_logs_the_rejected_image_text_and_the_substantive_flag(caplog):
     """A rejection has to be checkable: 'JSON artefact or garbage' fires on
     _ENTITY_GARBAGE, which was written for entity names, so the text it threw
