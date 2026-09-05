@@ -203,6 +203,22 @@ def test_sanitize_keeps_the_description_on_a_numeric_mismatch(caplog):
     assert "Numeric mismatch" in caplog.text
 
 
+def test_sanitize_logs_the_rejected_image_text_and_the_substantive_flag(caplog):
+    """A rejection has to be checkable: 'JSON artefact or garbage' fires on
+    _ENTITY_GARBAGE, which was written for entity names, so the text it threw
+    away is the only way to tell a real artefact from a false positive."""
+    analysis = _analysis(summary="A summary long enough to be real.")
+    analysis.image_substantive = True
+    analysis.image_description = "A map of the LOW-lying floodplain near Kherson."
+
+    with caplog.at_level("INFO"):
+        cleaned = _sanitize(analysis)
+
+    assert cleaned.image_description is None
+    assert "LOW-lying floodplain" in caplog.text
+    assert "image_substantive=True" in caplog.text
+
+
 def test_numeric_consistency_shared_unit_alone_is_not_comparable():
     # Two route legs, matched only by "km" — 1,608 pairs with 1,600, but 409 is
     # a different segment entirely. From the 2026-09-05 drain.

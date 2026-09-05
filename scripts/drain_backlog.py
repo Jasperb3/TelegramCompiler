@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +97,11 @@ def main() -> None:
     ap.add_argument("--since", metavar="YYYY-MM-DD",
                     help="drain cutoff; defaults to the earliest date under data/media/")
     args = ap.parse_args()
+
+    # main.py configures this at import; a standalone script has to do it itself,
+    # or the per-post INFO lines (including why an image description was
+    # rejected) never reach the terminal.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = load_config(args.config).with_analysis_profile(args.profile)
     with Database(cfg.storage.db_path) as db:

@@ -49,7 +49,11 @@ SYSTEM_PROMPT = (
     "subjects of the event — never the news agency, photographer, or platform credited as the "
     "source (AFP, Reuters, Telegram, X), and never generic terms ('military', 'officials').\n"
     "6. Set image_substantive=true only if the image contains information absent from the "
-    "text; if so, image_description must state that extra information in one sentence. If the "
+    "text; if so, image_description must state that extra information in one sentence and "
+    "must never be left empty. Describe what the picture shows — the scene, place, equipment, "
+    "damage, map or document in it — never the post, the screenshot, or the layout, and never "
+    "answer in prose that the image adds nothing (that is what image_substantive=false is for). "
+    "Write plain prose: no field names, no JSON, no braces or brackets. If the "
     "image contains non-English text (signs, banners, documents, captions), include an English "
     "translation of it in image_description.\n"
     "7. threat_level, exactly one of: CRITICAL, HIGH, MODERATE, LOW.\n"
@@ -644,9 +648,16 @@ def _sanitize(analysis: PostAnalysis) -> PostAnalysis:
     analysis.key_entities = clean_entities(analysis.key_entities)
     reject_reason = _image_reject_reason(analysis.image_description)
     if reject_reason is not None:
+        # image_substantive is not persisted, so without it in the log there is
+        # no way to tell the model obeying the "only if it adds information"
+        # gate from the model setting the flag and then omitting the text.
         log.info(
-            "No image description for post %r: %s",
-            analysis.title or analysis.summary[:60], reject_reason,
+            "No image description for post %r: %s (image_substantive=%s)%s",
+            analysis.title or analysis.summary[:60],
+            reject_reason,
+            analysis.image_substantive,
+            f" rejected text: {analysis.image_description.strip()[:200]!r}"
+            if analysis.image_description else "",
         )
     analysis.image_description = _clean_image_insights(analysis.image_description)
     conflict = (
