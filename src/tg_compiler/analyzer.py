@@ -647,7 +647,10 @@ def _sanitize(analysis: PostAnalysis) -> PostAnalysis:
         analysis.summary = ""
     analysis.key_entities = clean_entities(analysis.key_entities)
     reject_reason = _image_reject_reason(analysis.image_description)
-    if reject_reason is not None:
+    # Silent when the model neither claimed a substantive image nor returned any
+    # text: that is the correct outcome for a text-only post, and logging it
+    # buried the real rejections under one line per post.
+    if reject_reason is not None and (analysis.image_substantive or analysis.image_description):
         # image_substantive is not persisted, so without it in the log there is
         # no way to tell the model obeying the "only if it adds information"
         # gate from the model setting the flag and then omitting the text.
