@@ -117,6 +117,42 @@ def test_numeric_consistency_ignores_year_tokens():
     assert _check_numeric_consistency("Official toll of 203 confirmed dead", "Photo taken in 2026 shows the aftermath") is True
 
 
+def test_numeric_consistency_ignores_hyphenated_designators():
+    # "T-72" is a tank, not 72 of anything; against "80 killed" it is 11% apart.
+    assert _check_numeric_consistency("Officials say 80 killed in the strike", "Image shows a destroyed T-72 tank") is True
+    # "Kh-101" vs "95 drones" is 6.3% apart.
+    assert _check_numeric_consistency("Russia launched 95 drones overnight", "The debris is from a Kh-101 cruise missile") is True
+
+
+def test_numeric_consistency_ignores_thousands_separators():
+    # "1,200" previously yielded a phantom 1 AND a 200, so the 200 matched but
+    # the 1 collided with every small integer in the other text.
+    assert _check_numeric_consistency("Around 1,200 troops were redeployed", "The image shows 3 armoured columns") is True
+
+
+def test_numeric_consistency_thousands_separator_still_compared_as_one_number():
+    assert _check_numeric_consistency("Around 1,200 troops were redeployed", "A caption reading 4,500 troops") is False
+
+
+def test_numeric_consistency_aircraft_designator_false_positive():
+    # From the live DB: 737 vs 524 and 522 vs 737 are two halves of the same
+    # designator compared against each other across the two texts.
+    summary = "A Boeing 737-524 aircraft from Caspian Airlines was observed returning to the tarmac in Tehran."
+    image = "The image shows a flight tracking map for flight CP972, the aircraft type (Boeing 737-522) and registration number (EP1048)."
+    assert _check_numeric_consistency(summary, image) is True
+
+
+def test_numeric_consistency_notam_serial_false_positive():
+    # From the live DB: the "26" of NOTAM serial A0821/26 against "June 14".
+    summary = "Qatar established alternative flight paths through its airspace between June 7 and June 14."
+    image = "The image shows a formal NOTAM notice (OTDF A0821/26) regarding alternate routes within the Doha FIR."
+    assert _check_numeric_consistency(summary, image) is True
+
+
+def test_numeric_consistency_ignores_ordinals():
+    assert _check_numeric_consistency("Officials say 80 killed in the strike", "Insignia of the 72nd Mechanised Brigade is visible") is True
+
+
 def test_numeric_consistency_genuine_contradiction_still_detected():
     assert _check_numeric_consistency("Officials say 12 killed in the blast", "Image caption reads 45 killed") is False
 
@@ -311,6 +347,152 @@ async def test_process_unanalysed_since_logs_excluded_count(db, app_config, monk
         await analyzer.process_unanalysed(since=cutoff)
 
     assert "1 older unanalysed posts excluded" in caplog.text
+
+
+async def test_process_unanalysed_fetches_the_queue_only_once(db, app_config, monkeypatch):
+    """The exclusion count must come from a COUNT(*), not a second unbounded
+    fetch — the daemon sweep runs this every DAEMON_ANALYSIS_INTERVAL_SECS."""
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    db.insert_post(PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        text="x" * 50, media_paths=[], has_images=False, raw_json="{}",
+    ))
+
+    fetches = []
+    real_fetch = db.get_unanalysed_posts
+
+    def counting_fetch(*args, **kwargs):
+        fetches.append((args, kwargs))
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(db, "get_unanalysed_posts", counting_fetch)
+
+    analyzer = Analyzer(app_config, db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+    monkeypatch.setattr(analyzer, "analyze_post", lambda *a, **k: None)
+
+    await analyzer.process_unanalysed(since=datetime(2026, 6, 5, tzinfo=timezone.utc))
+
+    assert len(fetches) == 1
+
+
+async def test_process_unanalysed_tombstones_short_post_whose_media_is_purged(
+    db, app_config, monkeypatch, tmp_path
+):
+    """has_images is a claim about scrape time; purge_old_media() may since have
+    deleted the file, leaving a short post with nothing analysable in it."""
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    db.insert_post(PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        text="short", media_paths=[str(tmp_path / "gone.jpg")],
+        has_images=True, raw_json="{}",
+    ))
+
+    analyzer = Analyzer(app_config, db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fail(*a, **k):
+        raise AssertionError("a post with no usable content must not reach the LLM")
+
+    monkeypatch.setattr(analyzer, "analyze_post", fail)
+
+    analysed_count, skipped_count = await analyzer.process_unanalysed()
+
+    assert (analysed_count, skipped_count) == (0, 1)
+    assert db.get_unanalysed_posts() == []
+
+
+async def test_process_unanalysed_analyses_short_post_whose_media_is_present(
+    db, app_config, monkeypatch, tmp_path
+):
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    image = tmp_path / "present.jpg"
+    image.write_bytes(b"jpeg")
+    db.insert_post(PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        text="short", media_paths=[str(image)], has_images=True, raw_json="{}",
+    ))
+
+    analyzer = Analyzer(app_config, db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        return _analysis(summary="Real analysis output for a long post.")
+
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    assert await analyzer.process_unanalysed() == (1, 0)
+
+
+async def test_process_unanalysed_analyses_short_video_post_with_no_files(
+    db, app_config, monkeypatch
+):
+    """Videos are never downloaded, so has_video alone still means usable media."""
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    db.insert_post(PostRecord(
+        channel_id=1, channel_name="chan", message_id=1,
+        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        text="short", media_paths=[], has_images=False, has_video=True, raw_json="{}",
+    ))
+
+    analyzer = Analyzer(app_config, db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        return _analysis(summary="Real analysis output for a long post.")
+
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    assert await analyzer.process_unanalysed() == (1, 0)
+
+
+async def test_process_unanalysed_limit_bounds_the_queue_oldest_first(
+    db, app_config, monkeypatch
+):
+    from datetime import datetime, timezone
+
+    from tg_compiler.analyzer import Analyzer
+    from tg_compiler.db import PostRecord
+
+    for mid, day in ((1, 10), (2, 1)):
+        db.insert_post(PostRecord(
+            channel_id=1, channel_name="chan", message_id=mid,
+            timestamp=datetime(2026, 6, day, tzinfo=timezone.utc),
+            text="x" * 50, media_paths=[], has_images=False, raw_json="{}",
+        ))
+
+    analyzer = Analyzer(app_config, db)
+    monkeypatch.setattr(analyzer, "_server_reachable", lambda: True)
+
+    seen = []
+
+    async def fake_analyze_post(post, channel_cfg=None):
+        seen.append(post.message_id)
+        return _analysis(summary="Real analysis output for a long post.")
+
+    monkeypatch.setattr(analyzer, "analyze_post", fake_analyze_post)
+
+    assert await analyzer.process_unanalysed(limit=1) == (1, 0)
+    assert seen == [2]
 
 
 def test_clean_image_insights_rejects_none_provided():

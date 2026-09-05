@@ -8,7 +8,7 @@ import math
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from openai import LengthFinishReasonError, OpenAI
 from pydantic import BaseModel, Field, field_validator
@@ -178,6 +178,18 @@ def _encode_image(path: str) -> str | None:
     except Exception as e:
         log.warning("Could not read image %s: %s", path, e)
         return None
+
+
+def _has_usable_media(post: PostRecord) -> bool:
+    """Whether the post still carries media the model can actually see.
+
+    `has_images` / `media_paths` record what was there at scrape time, but
+    `main.purge_old_media()` deletes date directories older than
+    `storage.retention_days`, and `_encode_image()` then drops the missing file
+    silently. Videos are never downloaded, so `has_video` counts on its own."""
+    if post.has_video:
+        return True
+    return any(Path(p).exists() for p in post.media_paths)
 
 
 def build_messages(post: PostRecord, system_prompt: str) -> list[dict]:
@@ -472,39 +484,83 @@ def salvage_batch_items(raw: str) -> BatchAnalysis:
 _NUM_RE = re.compile(r'\b(\d+(?:\.\d+)?)\b')
 _TIME_TOKEN_RE = re.compile(r'\b\d{1,2}:\d{2}\b')  # e.g. "14:30"
 _YEAR_TOKEN_RE = re.compile(r'\b(?:19|20)\d{2}\b')  # e.g. "2026"
+_THOUSANDS_RE = re.compile(r'\b\d{1,3}(?:,\d{3})+\b')  # e.g. "1,200"
+_DESIGNATOR_RE = re.compile(
+    r'\b[A-Za-z]{1,4}-\d+(?:[-/]\d+)*\b'      # T-72, Su-34, Kh-101, S-300, MiG-29
+    r'|\b\d+-\d+\b'                            # Boeing 737-524
+    r'|\b[A-Za-z]{1,4}\d{3,}(?:/\d+)*\b'       # EP1048, CP972, NOTAM A0821/26
+    r'|\b\d+(?:st|nd|rd|th)\b'                  # 3rd Assault Brigade
+)
+_NUM_CONTEXT_CHARS = 30
+
+
+class _Num(NamedTuple):
+    """A number found in a text, with the surrounding words that give it meaning."""
+    value: float
+    context: str
 
 
 def _strip_non_quantity_numbers(text: str) -> str:
-    """Remove time-of-day and year tokens before numeric comparison — they
-    collide with casualty/quantity figures of similar magnitude (e.g. "14:30"
-    vs "30 dead") and are not the kind of number the consistency check is for."""
-    text = _TIME_TOKEN_RE.sub(" ", text)
-    text = _YEAR_TOKEN_RE.sub(" ", text)
-    return text
+    """Normalise `text` so only genuine quantities survive as numbers.
+
+    Times ("14:30"), years ("2026"), equipment and unit designators ("T-72",
+    "Boeing 737-524", "EP1048", NOTAM serial "A0821/26") and ordinals ("3rd")
+    are not quantities, but each collides with casualty and count figures of
+    similar magnitude — this corpus is saturated with them. Thousands
+    separators are joined up first, so "1,200 troops" yields 1200 rather than a
+    phantom 1 alongside a 200.
+
+    Every substitution preserves the length of what it replaces, so offsets into
+    the original text stay valid and _extract_numbers() can quote context."""
+    def join_thousands(m: re.Match) -> str:
+        digits = m.group(0).replace(",", "")
+        return digits + " " * (len(m.group(0)) - len(digits))
+
+    blank = lambda m: " " * len(m.group(0))  # noqa: E731
+    text = _THOUSANDS_RE.sub(join_thousands, text)
+    text = _TIME_TOKEN_RE.sub(blank, text)
+    text = _YEAR_TOKEN_RE.sub(blank, text)
+    return _DESIGNATOR_RE.sub(blank, text)
 
 
-def _check_numeric_consistency(summary: str, image_desc: str) -> bool:
-    """Return False if a number in image_desc contradicts a comparable number in summary.
+def _extract_numbers(text: str) -> list[_Num]:
+    """Every positive quantity in `text`, each with +/-30 chars of context."""
+    stripped = _strip_non_quantity_numbers(text)
+    out = []
+    for m in _NUM_RE.finditer(stripped):
+        value = float(m.group(1))
+        if value <= 0:
+            continue
+        start = max(0, m.start() - _NUM_CONTEXT_CHARS)
+        end = min(len(text), m.end() + _NUM_CONTEXT_CHARS)
+        out.append(_Num(value, text[start:end].strip()))
+    return out
+
+
+def _find_numeric_conflict(summary: str, image_desc: str) -> tuple[_Num, _Num] | None:
+    """Return the (image, summary) number pair that contradicts, or None.
 
     Two numbers are 'comparable' if they are within the same order of magnitude
-    (ratio ≤ 10x).  They 'contradict' if they differ by more than 5% relative to
+    (ratio <= 10x).  They 'contradict' if they differ by more than 5% relative to
     the smaller value.  When either text has no numbers, we assume consistent.
     """
     if not summary or not image_desc:
-        return True
-    summary = _strip_non_quantity_numbers(summary)
-    image_desc = _strip_non_quantity_numbers(image_desc)
-    s_nums = [float(x) for x in _NUM_RE.findall(summary) if float(x) > 0]
-    i_nums = [float(x) for x in _NUM_RE.findall(image_desc) if float(x) > 0]
-    if not s_nums or not i_nums:
-        return True
+        return None
+    s_nums = _extract_numbers(summary)
+    i_nums = _extract_numbers(image_desc)
     for img_n in i_nums:
         for sum_n in s_nums:
-            if max(img_n, sum_n) / min(img_n, sum_n) > 10.0:
+            lo, hi = sorted((img_n.value, sum_n.value))
+            if hi / lo > 10.0:
                 continue  # different orders of magnitude — unrelated quantities
-            if abs(img_n - sum_n) / min(img_n, sum_n) > 0.05:
-                return False
-    return True
+            if (hi - lo) / lo > 0.05:
+                return img_n, sum_n
+    return None
+
+
+def _check_numeric_consistency(summary: str, image_desc: str) -> bool:
+    """Return False if a number in image_desc contradicts a comparable number in summary."""
+    return _find_numeric_conflict(summary, image_desc) is None
 
 
 _REFUSAL_RE = re.compile(
@@ -521,12 +577,17 @@ def _sanitize(analysis: PostAnalysis) -> PostAnalysis:
         analysis.summary = ""
     analysis.key_entities = clean_entities(analysis.key_entities)
     analysis.image_description = _clean_image_insights(analysis.image_description)
-    if analysis.image_description and not _check_numeric_consistency(
-        analysis.summary, analysis.image_description
-    ):
+    conflict = (
+        _find_numeric_conflict(analysis.summary, analysis.image_description)
+        if analysis.image_description else None
+    )
+    if conflict is not None:
+        img_n, sum_n = conflict
         log.info(
-            "Image description dropped for post %r: numeric mismatch with summary",
+            "Image description dropped for post %r: numeric mismatch with summary "
+            "(image %g in %r vs summary %g in %r)",
             analysis.title or analysis.summary[:60],
+            img_n.value, img_n.context, sum_n.value, sum_n.context,
         )
         analysis.image_description = None
 
@@ -726,20 +787,28 @@ class Analyzer:
         self,
         channel_map: dict[int, ChannelConfig] | None = None,
         since: datetime | None = None,
+        limit: int | None = None,
     ) -> tuple[int, int]:
         """Analyse every unanalysed post up to lmstudio.max_concurrent_analyses in
         parallel, after a preflight reachability probe (aborts with everything left
-        queued if LM Studio is down). Posts under MIN_CONTENT_CHARS with no media are
-        skipped (recorded with category="Skipped") rather than sent to the LLM.
+        queued if LM Studio is down). Posts under MIN_CONTENT_CHARS with no usable
+        media are skipped (recorded with category="Skipped") rather than sent to the
+        LLM — "usable" means the media file still exists on disk, so a short post
+        whose image purge_old_media() has deleted is tombstoned, not analysed blind.
         If `since` is given, only posts with timestamp >= since are analysed — older
         stuck-unanalysed posts are left queued for a future unscoped run.
         When lmstudio.batch_size / batch_size_with_images exceed 1 the surviving
         posts are grouped by plan_batches() and analysed several per LLM call;
         at their default of 1 every post takes the original one-call-per-post path.
+        `limit` bounds the queue to the oldest N posts, so a large historical
+        backlog can be drained in chunks rather than in one unbounded run.
         Returns (analysed_count, skipped_count)."""
-        posts = self._db.get_unanalysed_posts(since=since)
+        posts = self._db.get_unanalysed_posts(since=since, limit=limit)
         if since is not None:
-            excluded = len(self._db.get_unanalysed_posts()) - len(posts)
+            excluded = (
+                self._db.count_unanalysed_posts()
+                - self._db.count_unanalysed_posts(since=since)
+            )
             if excluded:
                 log.info(
                     "--since filter: %d older unanalysed posts excluded from this run "
@@ -777,19 +846,14 @@ class Analyzer:
             )
             analysed += 1
 
-        # Content gate first, so short no-media posts never reach the LLM — batched
-        # or not — and are recorded as "Skipped" exactly as before.
+        # Content gate first, so short posts with no usable media never reach the
+        # LLM — batched or not — and are recorded as "Skipped" exactly as before.
         to_analyse: list[PostRecord] = []
         for post in posts:
-            if (
-                len(post.text.strip()) < MIN_CONTENT_CHARS
-                and not post.media_paths
-                and not post.has_video
-                and not post.has_images
-            ):
+            if len(post.text.strip()) < MIN_CONTENT_CHARS and not _has_usable_media(post):
                 self._db.insert_analysis(AnalysisRecord(
                     post_id=post.id,
-                    summary="",
+                    summary="media unavailable" if post.media_paths else "",
                     importance_score=None,
                     urgency_score=None,
                     credibility_score=None,

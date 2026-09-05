@@ -96,7 +96,9 @@ python -m tg_compiler.main --help
 
 Expected output:
 ```
-usage: tg_compiler [-h] [--config CONFIG] [--batch] [--daemon] [--generate] [--analyse] [--since TIME] [--layout {desktop,mobile}]
+usage: tg_compiler [-h] [--config CONFIG] [--batch] [--daemon] [--generate]
+                   [--analyse] [--since TIME] [--analysis-profile NAME]
+                   [--layout {desktop,mobile}]
 ```
 
 ---
@@ -368,8 +370,8 @@ What happens at startup:
 
 What happens when a new message arrives:
 1. Downloads attached media (if any)
-2. Inserts a `PostRecord` into SQLite
-3. Sends the post to LM Studio for analysis (including threat level) and saves the result
+2. Inserts a `PostRecord` into SQLite — analysis happens later, in the periodic sweep described above, not inline
+3. Advances the channel's cursor, so a later `--batch` resumes from here
 4. Duplicate posts (by channel_id + message_id) are silently skipped
 
 What happens at `generate_at` time each day:

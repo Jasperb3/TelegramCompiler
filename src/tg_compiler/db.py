@@ -182,18 +182,35 @@ class Database:
         )
         self._conn.commit()
 
-    def get_unanalysed_posts(self, since: datetime | None = None) -> list[PostRecord]:
-        query = """SELECT p.* FROM posts p
-                   LEFT JOIN analyses a ON a.post_id = p.id
-                   WHERE a.id IS NULL"""
-        params: tuple = ()
-        if since is not None:
-            # Timestamps are uniform ISO-8601 UTC strings, so lexicographic
-            # comparison is exact and hits idx_posts_timestamp (SEARCH not SCAN).
-            query += " AND p.timestamp >= ?"
-            params = (since.isoformat(),)
+    _UNANALYSED_WHERE = """FROM posts p
+                           LEFT JOIN analyses a ON a.post_id = p.id
+                           WHERE a.id IS NULL"""
+
+    def _unanalysed_since_clause(self, since: datetime | None) -> tuple[str, tuple]:
+        if since is None:
+            return "", ()
+        # Timestamps are uniform ISO-8601 UTC strings, so lexicographic
+        # comparison is exact and hits idx_posts_timestamp (SEARCH not SCAN).
+        return " AND p.timestamp >= ?", (since.isoformat(),)
+
+    def get_unanalysed_posts(
+        self, since: datetime | None = None, limit: int | None = None
+    ) -> list[PostRecord]:
+        clause, params = self._unanalysed_since_clause(since)
+        # Oldest first, so a bounded drain works the backlog in a deterministic
+        # order instead of arbitrary rowid order.
+        query = f"SELECT p.* {self._UNANALYSED_WHERE}{clause} ORDER BY p.timestamp ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (*params, limit)
         rows = self._conn.execute(query, params).fetchall()
         return [_row_to_post(r) for r in rows]
+
+    def count_unanalysed_posts(self, since: datetime | None = None) -> int:
+        """Count the analysis queue without materialising it as PostRecords."""
+        clause, params = self._unanalysed_since_clause(since)
+        query = f"SELECT COUNT(*) {self._UNANALYSED_WHERE}{clause}"
+        return self._conn.execute(query, params).fetchone()[0]
 
     def insert_analysis(self, rec: AnalysisRecord) -> int | None:
         cur = self._conn.execute(

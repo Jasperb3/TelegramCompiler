@@ -83,6 +83,51 @@ def test_get_unanalysed_posts_since_boundary_inclusive(db, sample_post):
     assert any(p.id == boundary_id for p in unanalysed)
 
 
+def test_count_unanalysed_posts(db, sample_post):
+    from dataclasses import replace
+
+    db.insert_post(replace(sample_post, message_id=1))
+    db.insert_post(replace(sample_post, message_id=2))
+
+    assert db.count_unanalysed_posts() == 2
+
+
+def test_count_unanalysed_posts_since_excludes_older_posts(db, sample_post):
+    from dataclasses import replace
+
+    db.insert_post(replace(sample_post, message_id=1, timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+    db.insert_post(replace(sample_post, message_id=2, timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc)))
+
+    assert db.count_unanalysed_posts(since=datetime(2026, 6, 5, tzinfo=timezone.utc)) == 1
+
+
+def test_count_unanalysed_posts_since_boundary_inclusive(db, sample_post):
+    from dataclasses import replace
+
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    db.insert_post(replace(sample_post, message_id=3, timestamp=cutoff))
+
+    assert db.count_unanalysed_posts(since=cutoff) == 1
+
+
+def test_get_unanalysed_posts_orders_oldest_first(db, sample_post):
+    from dataclasses import replace
+
+    db.insert_post(replace(sample_post, message_id=1, timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc)))
+    db.insert_post(replace(sample_post, message_id=2, timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+
+    assert [p.message_id for p in db.get_unanalysed_posts()] == [2, 1]
+
+
+def test_get_unanalysed_posts_limit_takes_the_oldest(db, sample_post):
+    from dataclasses import replace
+
+    db.insert_post(replace(sample_post, message_id=1, timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc)))
+    db.insert_post(replace(sample_post, message_id=2, timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+
+    assert [p.message_id for p in db.get_unanalysed_posts(limit=1)] == [2]
+
+
 def test_insert_analysis_and_joined_query(db, sample_post):
     post_id = db.insert_post(sample_post)
     rec = AnalysisRecord(
