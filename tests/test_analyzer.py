@@ -16,6 +16,16 @@ from tg_compiler.analyzer import (
 from tg_compiler.utils import clean_entities
 
 
+def _touch_images(tmp_path, n, start=0):
+    """n real image files, so _existing_media() sees them as still on disk."""
+    out = []
+    for i in range(start, start + n):
+        f = tmp_path / f"img{i}.jpg"
+        f.write_bytes(b"jpeg")
+        out.append(str(f))
+    return out
+
+
 def test_post_analysis_parses_valid_json():
     data = {
         "summary": "A test post about something.",
@@ -226,23 +236,29 @@ def test_images_were_sent_is_false_for_a_video_post_and_a_purged_path(tmp_path):
 
 
 def test_images_were_sent_respects_the_image_cap(tmp_path):
-    """Only the first `cap` paths are attached, so a file past the cap was never sent."""
+    """The cap counts files that still exist: missing paths no longer consume a
+    slot (they are filtered before the cap), but a real file past the cap is not
+    sent."""
     from datetime import datetime, timezone
 
-    from tg_compiler.analyzer import _images_were_sent
+    from tg_compiler.analyzer import _existing_media, _images_were_sent
     from tg_compiler.db import PostRecord
 
-    beyond = tmp_path / "fourth.jpg"
-    beyond.write_bytes(b"jpeg")
-    post = PostRecord(
-        channel_id=1, channel_name="chan", message_id=1,
-        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc), text="x" * 50,
-        media_paths=[str(tmp_path / f"missing{i}.jpg") for i in range(3)] + [str(beyond)],
-        has_images=True, raw_json="{}",
-    )
+    present = _touch_images(tmp_path, 4)
 
-    assert _images_were_sent(post, 3) is False
-    assert _images_were_sent(post, 4) is True
+    def post(paths):
+        return PostRecord(
+            channel_id=1, channel_name="chan", message_id=1,
+            timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc), text="x" * 50,
+            media_paths=paths, has_images=True, raw_json="{}",
+        )
+
+    purged = [str(tmp_path / f"missing{i}.jpg") for i in range(3)]
+    # Three purged paths ahead of a real one: the real image is still sent.
+    assert _images_were_sent(post(purged + present[:1]), 3) is True
+    assert _images_were_sent(post(purged), 3) is False
+    # Four real images, cap 3: nothing past the cap is sent.
+    assert len(_existing_media(post(present), 3)) == 3
 
 
 def test_sanitize_discards_a_description_when_no_image_was_sent(caplog):
@@ -756,20 +772,23 @@ def test_token_budget_scales_with_text_length(lm_cfg):
     assert long == lm_cfg.analysis_base_tokens + math.ceil(2000 * lm_cfg.analysis_tokens_per_char)
 
 
-def test_token_budget_counts_images(lm_cfg):
+def test_token_budget_counts_images(lm_cfg, tmp_path):
+    # Real files: the budget counts the images actually sent, and _existing_media()
+    # drops paths that are no longer on disk.
+    imgs = _touch_images(tmp_path, 2)
     no_img = compute_token_budget(_budget_post(text="x" * 100), lm_cfg)
     two_img = compute_token_budget(
-        _budget_post(text="x" * 100, media_paths=["a.jpg", "b.jpg"]), lm_cfg
+        _budget_post(text="x" * 100, media_paths=imgs), lm_cfg
     )
     assert two_img == no_img + 2 * lm_cfg.analysis_tokens_per_image
 
 
-def test_token_budget_clamped_at_max():
+def test_token_budget_clamped_at_max(tmp_path):
     from tg_compiler.config import LMStudioConfig
 
     cfg = LMStudioConfig(model="test-model", analysis_max_tokens=2000)
     budget = compute_token_budget(
-        _budget_post(text="x" * 10000, media_paths=["a.jpg", "b.jpg", "c.jpg"]), cfg
+        _budget_post(text="x" * 10000, media_paths=_touch_images(tmp_path, 3)), cfg
     )
     assert budget == 2000
 
@@ -952,14 +971,14 @@ def _batch_item(index, **overrides):
     return BatchPostAnalysis.model_validate(base)
 
 
-def test_build_batch_messages_numbers_posts_and_interleaves_images(monkeypatch):
+def test_build_batch_messages_numbers_posts_and_interleaves_images(monkeypatch, tmp_path):
     from tg_compiler.analyzer import SYSTEM_PROMPT, build_batch_messages
 
     monkeypatch.setattr("tg_compiler.analyzer._encode_image", lambda p: f"B64<{p}>")
     cfg = _batch_config(batch_images_per_post=1).lmstudio
     posts = [
         _batch_post(1, text="first post"),
-        _batch_post(2, text="second post", media_paths=["a.jpg", "b.jpg"]),
+        _batch_post(2, text="second post", media_paths=_touch_images(tmp_path, 2)),
     ]
 
     messages = build_batch_messages(posts, SYSTEM_PROMPT, cfg)
@@ -974,7 +993,8 @@ def test_build_batch_messages_numbers_posts_and_interleaves_images(monkeypatch):
     assert "### POST 2" in parts[2]["text"]
     # only one image per post, and it follows its own post's text part
     assert parts[3]["type"] == "image_url"
-    assert "B64<a.jpg>" in parts[3]["image_url"]["url"]
+    assert "B64<" in parts[3]["image_url"]["url"]
+    assert "img0.jpg>" in parts[3]["image_url"]["url"]
     assert len(parts) == 4
 
 
@@ -1033,7 +1053,7 @@ def test_batch_token_budget_scales_with_posts_and_clamps():
     assert compute_batch_token_budget([_batch_post(i) for i in range(10)], cfg) == 1250
 
 
-def test_batch_token_budget_counts_images_up_to_the_per_post_cap():
+def test_batch_token_budget_counts_images_up_to_the_per_post_cap(tmp_path):
     from tg_compiler.analyzer import compute_batch_token_budget
 
     cfg = _batch_config(
@@ -1041,7 +1061,7 @@ def test_batch_token_budget_counts_images_up_to_the_per_post_cap():
         batch_tokens_per_char=0.0, batch_tokens_per_image=50,
         batch_images_per_post=2, batch_max_tokens=99999,
     ).lmstudio
-    post = _batch_post(1, media_paths=["a.jpg", "b.jpg", "c.jpg"])
+    post = _batch_post(1, media_paths=_touch_images(tmp_path, 3))
     assert compute_batch_token_budget([post], cfg) == 1100
 
 
@@ -1649,3 +1669,60 @@ def test_batch_schema_requires_the_opening_anchor():
     required = BatchPostAnalysis.model_json_schema()["required"]
     assert "opening" in required
     assert "index" in required
+
+
+def _media_post(tmp_path, paths, **kw):
+    from datetime import datetime, timezone
+
+    from tg_compiler.db import PostRecord
+
+    base = dict(channel_id=1, channel_name="chan", message_id=1,
+                timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                text="x" * 50, media_paths=paths, has_images=bool(paths),
+                has_video=False, raw_json="{}")
+    return PostRecord(**{**base, **kw})
+
+
+def test_build_messages_skips_a_purged_path_and_still_fills_the_cap(tmp_path, caplog):
+    import logging
+
+    from tg_compiler.analyzer import MAX_IMAGES_PER_POST, build_messages
+
+    present = _touch_images(tmp_path, MAX_IMAGES_PER_POST)
+    post = _media_post(tmp_path, [str(tmp_path / "gone.jpg"), *present])
+
+    with caplog.at_level(logging.WARNING):
+        msgs = build_messages(post, "sys")
+
+    images = [p for p in msgs[1]["content"] if p["type"] == "image_url"]
+    assert len(images) == MAX_IMAGES_PER_POST
+    assert "Could not read image" not in caplog.text
+
+
+def test_build_batch_messages_skips_purged_paths(tmp_path, caplog):
+    import logging
+
+    from tg_compiler.analyzer import build_batch_messages
+    from tg_compiler.config import LMStudioConfig
+
+    cfg = LMStudioConfig(model="m", batch_images_per_post=2)
+    post = _media_post(tmp_path, [str(tmp_path / "gone.jpg"), *_touch_images(tmp_path, 1)])
+
+    with caplog.at_level(logging.WARNING):
+        msgs = build_batch_messages([post], "sys", cfg)
+
+    images = [p for p in msgs[1]["content"] if p["type"] == "image_url"]
+    assert len(images) == 1
+    assert "Could not read image" not in caplog.text
+
+
+def test_token_budgets_count_only_images_that_still_exist(tmp_path):
+    from tg_compiler.analyzer import compute_batch_token_budget, compute_token_budget
+    from tg_compiler.config import LMStudioConfig
+
+    cfg = LMStudioConfig(model="m")
+    purged = _media_post(tmp_path, [str(tmp_path / "gone.jpg")])
+    text_only = _media_post(tmp_path, [])
+
+    assert compute_token_budget(purged, cfg) == compute_token_budget(text_only, cfg)
+    assert compute_batch_token_budget([purged], cfg) == compute_batch_token_budget([text_only], cfg)

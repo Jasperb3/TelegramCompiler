@@ -190,7 +190,11 @@ def _encode_image(path: str) -> str | None:
         data = Path(path).read_bytes()
         return base64.b64encode(data).decode()
     except Exception as e:
-        log.warning("Could not read image %s: %s", path, e)
+        # DEBUG, not WARNING: callers filter absent paths through _existing_media()
+        # first, so reaching this means a file that exists but cannot be decoded —
+        # rare, and not the routine "media purged by retention" case that once made
+        # this line fire on every post in a historical backlog.
+        log.debug("Could not read image %s: %s", path, e)
         return None
 
 
@@ -207,7 +211,23 @@ def _images_were_sent(post: PostRecord, cap: int) -> bool:
     post still references, and re-reading every image to check would double an
     analysis run's I/O. A file that exists but fails to decode is the one gap,
     and _encode_image() already logs that."""
-    return any(Path(p).exists() for p in post.media_paths[:cap])
+    return bool(_existing_media(post, cap))
+
+
+def _existing_media(post: PostRecord, cap: int) -> list[str]:
+    """The first `cap` media paths that are still on disk.
+
+    The cap is applied *after* the existence filter, so a path that
+    purge_old_media() deleted (or that never downloaded) no longer consumes one of
+    the model's image slots — and the prompt builders never hand _encode_image() a
+    path they already know is gone."""
+    existing: list[str] = []
+    for path in post.media_paths:
+        if Path(path).exists():
+            existing.append(path)
+            if len(existing) == cap:
+                break
+    return existing
 
 
 def _has_usable_media(post: PostRecord) -> bool:
@@ -227,7 +247,7 @@ def build_messages(post: PostRecord, system_prompt: str) -> list[dict]:
     header = f"Post from {post.channel_name} at {post.timestamp.isoformat()}:\n\n{text}"
 
     content: list[dict] = [{"type": "text", "text": header}]
-    for path in post.media_paths[:MAX_IMAGES_PER_POST]:
+    for path in _existing_media(post, MAX_IMAGES_PER_POST):
         b64 = _encode_image(path)
         if b64:
             content.append({
@@ -256,7 +276,7 @@ def compute_token_budget(post: PostRecord, cfg: LMStudioConfig) -> int:
         min(base + text_chars * per_char + images * per_image, max)
     """
     text_chars = min(len(post.text), MAX_PROMPT_TEXT_CHARS)
-    n_images = min(len(post.media_paths), MAX_IMAGES_PER_POST)
+    n_images = len(_existing_media(post, MAX_IMAGES_PER_POST))
     budget = (
         cfg.analysis_base_tokens
         + math.ceil(text_chars * cfg.analysis_tokens_per_char)
@@ -317,7 +337,7 @@ def build_batch_messages(
                 f"Time: {post.timestamp.isoformat()}\nText: {text}"
             ),
         })
-        for path in post.media_paths[:cfg.batch_images_per_post]:
+        for path in _existing_media(post, cfg.batch_images_per_post):
             b64 = _encode_image(path)
             if b64:
                 content.append({
@@ -375,7 +395,7 @@ def compute_batch_token_budget(posts: list[PostRecord], cfg: LMStudioConfig) -> 
         min(base + posts * per_post + text_chars * per_char + images * per_image, max)
     """
     text_chars = sum(min(len(p.text), MAX_PROMPT_TEXT_CHARS) for p in posts)
-    n_images = sum(min(len(p.media_paths), cfg.batch_images_per_post) for p in posts)
+    n_images = sum(len(_existing_media(p, cfg.batch_images_per_post)) for p in posts)
     budget = (
         cfg.batch_base_tokens
         + len(posts) * cfg.batch_tokens_per_post
@@ -934,8 +954,8 @@ class Analyzer:
             )
             if excluded:
                 log.info(
-                    "--since filter: %d older unanalysed posts excluded from this run "
-                    "(predate %s), still queued for a future unscoped run",
+                    "Analysis window: %d older unanalysed posts excluded from this run "
+                    "(predate %s), still queued for a later run with an explicit --since",
                     excluded,
                     since.isoformat(),
                 )
