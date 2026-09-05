@@ -298,3 +298,9 @@ def test_init_schema_dedupes_pre_existing_duplicate_analyses(tmp_path):
     assert len(rows) == 1
     assert rows[0]["summary"] == "first"
     database.close()
+
+
+def test_update_post_media_paths_round_trips(db, sample_post):
+    post_id = db.insert_post(sample_post)
+    db.update_post_media_paths(post_id, ["a/b/1.jpg", "a/b/2.jpg"])
+    assert db.get_post(post_id).media_paths == ["a/b/1.jpg", "a/b/2.jpg"]

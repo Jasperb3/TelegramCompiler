@@ -212,6 +212,15 @@ class Database:
         query = f"SELECT COUNT(*) {self._UNANALYSED_WHERE}{clause}"
         return self._conn.execute(query, params).fetchone()[0]
 
+    def update_post_media_paths(self, post_id: int, paths: list[str]) -> None:
+        """Rewrite a post's media_paths after scraper.repair_missing_media() has
+        re-downloaded files that purge_old_media() or a failed download left absent,
+        so the repair isn't attempted again on the next run."""
+        self._conn.execute(
+            "UPDATE posts SET media_paths = ? WHERE id = ?", (json.dumps(paths), post_id)
+        )
+        self._conn.commit()
+
     def insert_analysis(self, rec: AnalysisRecord) -> int | None:
         cur = self._conn.execute(
             """INSERT OR IGNORE INTO analyses
