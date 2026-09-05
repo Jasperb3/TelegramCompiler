@@ -75,6 +75,38 @@ lmstudio:
   model_ttl_seconds: 3600           # LM Studio unloads an idle model after this, so a crashed run strands nothing
   # model_context_length: 32768     # optional load-time context override
 
+  # --- Per-run-mode analysis profiles ---
+  # --batch/--since select "batch"; --daemon selects "daemon";
+  # --analysis-profile NAME overrides either. Omit this block entirely and both
+  # modes just use the settings above, exactly as before.
+  #
+  # Why a profile rather than just a model name: token budgets, concurrency and
+  # context length have to match the model. A reasoning model needs a large
+  # analysis_base_tokens or its JSON is truncated mid-deliberation; a small model
+  # needs far less, and running several large-budget image requests at once will
+  # exhaust LM Studio's context. Keep each model's settings with the model.
+  #
+  # analysis_profiles:
+  #   batch:                          # whole-day catch-up: speed matters most
+  #     model: "mistralai/ministral-3-3b"
+  #     analysis_base_tokens: 700
+  #     analysis_tokens_per_image: 400
+  #     analysis_max_tokens: 1600
+  #     max_concurrent_analyses: 4
+  #     model_context_length: 32768
+  #     batch_size: 1                 # batching only pays off for a reasoning model
+  #     batch_size_with_images: 1
+  #   daemon:                         # live monitoring: quality matters more
+  #     model: "prism-ml/bonsai-27b"  # ideally the same as synthesis_model, or every
+  #                                   # sweep swaps weights around the nightly run
+  #     analysis_base_tokens: 9500
+  #     analysis_tokens_per_image: 12500
+  #     analysis_max_tokens: 16000
+  #     max_concurrent_analyses: 1
+  #     model_context_length: 32768
+  #     batch_size: 10                # a reasoning model needs batching to keep up
+  #     batch_size_with_images: 3
+
 triage:
   keywords: ["urgent", "breaking", "launch"]  # words that add keyword_boost to a post's score
   keyword_boost: 0.5        # score added when a keyword matches (capped at 5.0 total)

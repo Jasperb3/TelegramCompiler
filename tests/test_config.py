@@ -167,3 +167,90 @@ def test_min_composite_score_default_is_3_5(tmp_path):
     f.write_text(MINIMAL_YAML)
     cfg = load_config(str(f))
     assert cfg.triage.min_composite_score == 3.5
+
+
+# --------------------------------------------------------------------------
+# Per-run-mode analysis profiles
+# --------------------------------------------------------------------------
+
+
+def _profiled_lmstudio(**profiles):
+    from tg_compiler.config import LMStudioConfig
+
+    return LMStudioConfig(
+        model="shared-model",
+        analysis_model="small-model",
+        analysis_base_tokens=700,
+        analysis_max_tokens=1600,
+        max_concurrent_analyses=4,
+        analysis_profiles=profiles,
+    )
+
+
+def test_profile_overrides_only_the_fields_it_sets():
+    cfg = _profiled_lmstudio(daemon={"analysis_base_tokens": 9500, "analysis_max_tokens": 16000})
+    daemon = cfg.with_analysis_profile("daemon")
+
+    assert daemon.analysis_base_tokens == 9500
+    assert daemon.analysis_max_tokens == 16000
+    # untouched fields are inherited
+    assert daemon.max_concurrent_analyses == 4
+    assert daemon.analysis_model == "small-model"
+
+
+def test_profile_model_becomes_the_analysis_model_only():
+    """A profile's `model:` is the analysis model. `model` itself stays the global
+    fallback that synthesis resolves through, so a profile must not hijack it."""
+    cfg = _profiled_lmstudio(daemon={"model": "big-model"})
+    daemon = cfg.with_analysis_profile("daemon")
+
+    assert daemon.model_for("analysis") == "big-model"
+    assert daemon.model == "shared-model"
+    assert daemon.model_for("synthesis") == "shared-model"
+
+
+def test_profile_values_are_revalidated_after_merging():
+    """model_copy(update=...) skips validators, so a profile could otherwise set
+    analysis_base_tokens above analysis_max_tokens and truncate every response."""
+    import pytest
+
+    cfg = _profiled_lmstudio(bad={"analysis_base_tokens": 20000})
+    with pytest.raises(ValidationError, match="analysis_base_tokens"):
+        cfg.with_analysis_profile("bad")
+
+
+def test_unknown_profile_leaves_the_config_untouched():
+    cfg = _profiled_lmstudio(daemon={"model": "big-model"})
+    assert cfg.with_analysis_profile("nope") is cfg
+    assert cfg.with_analysis_profile(None) is cfg
+
+
+def test_profile_rejects_unknown_keys():
+    import pytest
+
+    with pytest.raises(ValidationError):
+        _profiled_lmstudio(daemon={"analysis_base_tokns": 9500})  # typo
+
+
+def test_app_config_with_analysis_profile_replaces_lmstudio():
+    from tg_compiler.config import AppConfig, TelegramConfig
+
+    app = AppConfig(
+        telegram=TelegramConfig(api_id=1, api_hash="x", channels=[]),
+        lmstudio=_profiled_lmstudio(daemon={"model": "big-model", "max_concurrent_analyses": 1}),
+    )
+    resolved = app.with_analysis_profile("daemon")
+
+    assert resolved.lmstudio.model_for("analysis") == "big-model"
+    assert resolved.lmstudio.max_concurrent_analyses == 1
+    # the original is not mutated
+    assert app.lmstudio.model_for("analysis") == "small-model"
+    assert app.lmstudio.max_concurrent_analyses == 4
+
+
+def test_config_without_profiles_is_unchanged():
+    from tg_compiler.config import LMStudioConfig
+
+    cfg = LMStudioConfig(model="m")
+    assert cfg.analysis_profiles == {}
+    assert cfg.with_analysis_profile("batch") is cfg
