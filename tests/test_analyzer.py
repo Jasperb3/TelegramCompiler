@@ -189,26 +189,32 @@ def test_extract_numbers_does_not_split_a_plain_decimal():
     assert [n.value for n in _extract_numbers("A 7.8 magnitude quake")] == [7.8]
 
 
-def test_sanitize_strips_only_the_contradicting_sentence():
-    analysis = _analysis(summary="Officials say 12 killed in the blast.")
-    analysis.image_description = (
-        "The image shows a damaged apartment block in central Kharkiv. "
-        "A caption reads 45 killed. "
-        "Cyrillic text on the banner reads 'emergency services'."
-    )
-
-    cleaned = _sanitize(analysis)
-
-    assert "damaged apartment block" in cleaned.image_description
-    assert "emergency services" in cleaned.image_description
-    assert "45" not in cleaned.image_description
-
-
-def test_sanitize_nulls_description_that_is_only_the_contradiction():
+def test_sanitize_keeps_the_description_on_a_numeric_mismatch(caplog):
+    """Measured over a live 500-post run, every numeric drop was a false
+    positive; the rule's only true positive across 13,446 stored descriptions is
+    one earthquake caption. It warns now, it does not destroy the field."""
     analysis = _analysis(summary="Officials say 12 killed in the blast.")
     analysis.image_description = "A caption reads 45 killed."
 
-    assert _sanitize(analysis).image_description is None
+    with caplog.at_level("WARNING"):
+        cleaned = _sanitize(analysis)
+
+    assert "45 killed" in cleaned.image_description
+    assert "Numeric mismatch" in caplog.text
+
+
+def test_numeric_consistency_shared_unit_alone_is_not_comparable():
+    # Two route legs, matched only by "km" — 1,608 pairs with 1,600, but 409 is
+    # a different segment entirely. From the 2026-09-05 drain.
+    assert _check_numeric_consistency(
+        "Ukraine to Tyumen in Russia (~1,600 km), illustrating logistical routes.",
+        "Marked distances (~1,608 km and ~409 km segments) and colored zones.",
+    ) is True
+    # A percentage and a dollar amount, matched only by "USD".
+    assert _check_numeric_consistency(
+        "Brent crude rose, reflecting a rise of about $3.587 USD in a single day.",
+        "Brent crude oil, indicating a 4.33% increase to $86.417 USD over the session.",
+    ) is True
 
 
 def test_numeric_consistency_genuine_contradiction_still_detected():

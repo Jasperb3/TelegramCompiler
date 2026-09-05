@@ -118,14 +118,19 @@ _NO_EXTRA_INFO_RE = re.compile(
 )
 
 
-def _clean_image_insights(text: str | None) -> str | None:
+def _image_reject_reason(text: str | None) -> str | None:
+    """Why this image description is unusable, or None if it is fine.
+
+    Single source of truth for the rejection rules, so _sanitize() can report
+    which one fired — the missing-description rate is dominated by these, not by
+    the numeric-consistency check, and until now nothing recorded why."""
     if not text:
-        return None
+        return "model returned nothing"
     stripped = text.strip()
     if stripped.lower() in ('n/a', 'none', 'no image provided', 'no image provided.',
                              'no image.', 'no image', 'na', '', 'none provided',
                              'none provided.', 'no video provided', 'no video provided.'):
-        return None
+        return "boilerplate 'none'"
     low = stripped.lower()
     if (
         low.startswith('a telegram post from')
@@ -133,17 +138,22 @@ def _clean_image_insights(text: str | None) -> str | None:
         or 'text-only announcement' in low
         or 'text-based report' in low
         or 'featuring a text' in low
-        # Descriptions whose content is "there is nothing extra here" — the model
-        # answering the image_substantive question in prose instead of the flag.
-        # They render an "Image" line in the briefing that tells the reader nothing.
-        or _NO_EXTRA_INFO_RE.search(low)
     ):
-        return None
+        return "describes the post, not the picture"
+    # Descriptions whose content is "there is nothing extra here" — the model
+    # answering the image_substantive question in prose instead of the flag.
+    # They render an "Image" line in the briefing that tells the reader nothing.
+    if _NO_EXTRA_INFO_RE.search(low):
+        return "says the image adds nothing"
     if len(stripped) < 10:
-        return None
+        return "too short"
     if _ENTITY_GARBAGE.search(stripped) or '{' in stripped or '}' in stripped:
-        return None
-    return stripped
+        return "JSON artefact or garbage"
+    return None
+
+
+def _clean_image_insights(text: str | None) -> str | None:
+    return None if _image_reject_reason(text) else text.strip()
 
 
 def parse_analysis_fallback(raw: str) -> PostAnalysis:
@@ -507,14 +517,24 @@ its it as has have had but not more than about over near into out up down per sa
 say says reported reportedly approximately around least some other new also which
 who when where while their his her there here between during after before
 """.split())
-_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+# Units of measure, currencies and magnitude words say how a number is expressed,
+# not what it counts. Two distances both in "km", or a percentage and a price
+# both trailing "USD", are not thereby comparable — measured on the 2026-09-05
+# drain, that alone produced two of three false positives.
+_UNIT_WORDS = frozenset("""
+km kilometre kilometer mile mi metre meter cm mm ft foot feet yard inch
+kg kilogram gram tonne ton lb pound ounce litre liter gallon barrel
+usd eur gbp rub uah dollar euro cent percent pct
+second sec minute min hour hr day week month year decade
+million billion trillion thousand hundred unit degree celsius fahrenheit
+mph kph knot volt watt hectare acre
+""".split())
 
 
 class _Num(NamedTuple):
     """A number found in a text, with the surrounding words that give it meaning."""
     value: float
     context: str
-    start: int
     nouns: frozenset[str]
 
 
@@ -555,9 +575,11 @@ def _nouns_after(text: str, offset: int) -> frozenset[str]:
     """The first few content words following a number — what it counts.
 
     A window rather than the single next token, because the unit and the noun
-    are often separated ("7.8 magnitude earthquake" against "M8.4 earthquake")."""
+    are often separated ("7.8 magnitude earthquake" against "M8.4 earthquake").
+    Units themselves are excluded — they say how a number is expressed, not what
+    it counts."""
     words = (w.group(0).lower().rstrip("s") for w in _WORD_RE.finditer(text, offset))
-    kept = [w for w in words if w and w not in _NOUN_STOPWORDS]
+    kept = [w for w in words if w and w not in _NOUN_STOPWORDS and w not in _UNIT_WORDS]
     return frozenset(kept[:_NOUN_WINDOW_WORDS])
 
 
@@ -571,9 +593,7 @@ def _extract_numbers(text: str) -> list[_Num]:
             continue
         start = max(0, m.start() - _NUM_CONTEXT_CHARS)
         end = min(len(text), m.end() + _NUM_CONTEXT_CHARS)
-        out.append(_Num(
-            value, text[start:end].strip(), m.start(), _nouns_after(stripped, m.end()),
-        ))
+        out.append(_Num(value, text[start:end].strip(), _nouns_after(stripped, m.end())))
     return out
 
 
@@ -604,23 +624,6 @@ def _find_numeric_conflict(summary: str, image_desc: str) -> tuple[_Num, _Num] |
     return None
 
 
-def _drop_sentence_at(text: str, offset: int) -> str | None:
-    """Remove the sentence containing `offset`, keeping the rest of `text`.
-
-    A contradicted number condemns its own claim, not the whole description —
-    what is shown, where, and any translated on-image text are usually in other
-    sentences and were fine. Returns None when nothing substantive survives."""
-    sentences = _SENTENCE_SPLIT_RE.split(text)
-    kept, pos = [], 0
-    for sentence in sentences:
-        start = text.index(sentence, pos)
-        pos = start + len(sentence)
-        if not start <= offset < pos:
-            kept.append(sentence)
-    remaining = " ".join(kept).strip()
-    return remaining or None
-
-
 def _check_numeric_consistency(summary: str, image_desc: str) -> bool:
     """Return False if a number in image_desc contradicts a comparable number in summary."""
     return _find_numeric_conflict(summary, image_desc) is None
@@ -639,6 +642,12 @@ def _sanitize(analysis: PostAnalysis) -> PostAnalysis:
     if _REFUSAL_RE.search(analysis.summary):
         analysis.summary = ""
     analysis.key_entities = clean_entities(analysis.key_entities)
+    reject_reason = _image_reject_reason(analysis.image_description)
+    if reject_reason is not None:
+        log.info(
+            "No image description for post %r: %s",
+            analysis.title or analysis.summary[:60], reject_reason,
+        )
     analysis.image_description = _clean_image_insights(analysis.image_description)
     conflict = (
         _find_numeric_conflict(analysis.summary, analysis.image_description)
@@ -646,15 +655,19 @@ def _sanitize(analysis: PostAnalysis) -> PostAnalysis:
     )
     if conflict is not None:
         img_n, sum_n = conflict
-        kept = _drop_sentence_at(analysis.image_description, img_n.start)
+        # Reported, never acted on. Across 13,446 stored descriptions this rule
+        # has one demonstrated true positive, and every drop in a live 500-post
+        # run was a false positive — one of them ("1.4 million barrels/day"
+        # current against "2 million barrels per day" projected) sharing both
+        # unit and noun, so no lexical test can separate it. Losing an entire
+        # image description costs more than an odd number the reader can see
+        # sitting next to the summary.
         log.warning(
-            "Image description %s for post %r: numeric mismatch with summary "
-            "(image %g in %r vs summary %g in %r)",
-            "sentence dropped" if kept else "dropped",
+            "Numeric mismatch between image description and summary for post %r "
+            "(image %g in %r vs summary %g in %r) — description kept",
             analysis.title or analysis.summary[:60],
             img_n.value, img_n.context, sum_n.value, sum_n.context,
         )
-        analysis.image_description = kept
 
     analysis.title = escape_html(analysis.title)
     analysis.summary = escape_html(analysis.summary)
