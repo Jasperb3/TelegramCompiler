@@ -28,7 +28,7 @@ Telegram channels
 
 Two operating modes:
 - **`--batch`**: one-shot run — scrape all channels, analyse everything, generate today's PDF with intelligence front page prepended automatically
-- **`--daemon`**: long-running — listen for live messages, analyse as they arrive, generate PDF daily at a configured time
+- **`--daemon`**: long-running — listen for live messages, store them and analyse in a sweep every 10 minutes, generate PDF daily at a configured time
 
 ---
 
@@ -132,6 +132,7 @@ telegram:
       priority: 0.8
   rate_limit_delay_ms: 500      # pause between channel scrapes in ms (be conservative with Telegram)
   lookback_seconds: 604800      # how far back to fetch on first run (default: 1 week)
+                                # capped at storage.analysis_lookback_days; --since overrides
                                 # use --batch --since HH:MM for a one-off lookback instead
 
 lmstudio:
@@ -289,14 +290,29 @@ python -m tg_compiler.main --batch
 What happens:
 1. Connects to Telegram
 2. For each channel: fetches every message since the last run (no cap), downloads attached photos — a failure on one channel is logged and the rest continue
-3. Sends each new post to LM Studio for analysis — headline title, importance, urgency, credibility, relevance, category, threat level, and key entities. Posts with fewer than 30 characters of text and no media are skipped without an LLM call
-4. Runs triage: scores posts (channel priority × credibility, keyword boost, rumour penalty, recency decay), clusters cross-channel reports of the same story — the best report is kept and the rest become "corroborated by" references that boost its score — then splits into main/appendix
-5. Generates `briefings/YYYY-MM-DD/TheDailyTelegram_YYYY-MM-DD_HHMMSS.pdf`
-6. Sends the triaged main items, a 7-day entity/category mention-trend table, and yesterday's assessment themes to LM Studio for intelligence synthesis
-7. Prepends a structured intelligence front page (situation summary, key themes with source citations and continuity tags, signals & warnings, named actors, emerging actors) to the briefing PDF, and persists the assessment for next-day continuity
-8. Disconnects
+3. Re-downloads media for any post inside the analysis window whose image file is missing — either the original download failed, or `purge_old_media()` has since deleted it. Capped at 200 posts per run; a post whose message Telegram no longer serves is left alone and analysed as text-only
+4. Sends each new post to LM Studio for analysis — headline title, importance, urgency, credibility, relevance, category, threat level, and key entities. Posts with fewer than 30 characters of text and no media are skipped without an LLM call
+5. Runs triage: scores posts (channel priority × credibility, keyword boost, rumour penalty, recency decay), clusters cross-channel reports of the same story — the best report is kept and the rest become "corroborated by" references that boost its score — then splits into main/appendix
+6. Generates `briefings/YYYY-MM-DD/TheDailyTelegram_YYYY-MM-DD_HHMMSS.pdf`
+7. Sends the triaged main items, a 7-day entity/category mention-trend table, and yesterday's assessment themes to LM Studio for intelligence synthesis
+8. Prepends a structured intelligence front page (situation summary, key themes with source citations and continuity tags, signals & warnings, named actors, emerging actors) to the briefing PDF, and persists the assessment for next-day continuity
+9. Disconnects
 
 Subsequent `--batch` runs on the same day are safe — cursor tracking ensures no post is fetched twice, and UNIQUE constraints prevent duplicate DB entries. If LM Studio is unreachable during the front page step, a warning is logged and the briefing PDF is kept as-is.
+
+### The analysis window
+
+`--batch` analyses unanalysed posts from the last `storage.analysis_lookback_days` days only, which defaults to `storage.retention_days` (30). Older posts stay in the queue untouched.
+
+The reason is media. `purge_old_media()` deletes image files older than `retention_days`, but the post row keeps referencing them, so analysing a post past that point means analysing it blind on its text while the briefing still renders an "Image" line. Reaching back no further than media is kept keeps the two in step.
+
+The window also caps `telegram.lookback_seconds`, so resetting cursors can't pull in months of history whose images will never exist.
+
+One consequence worth knowing: posts older than the window accumulate in the database as permanently unanalysed. They are counted in a log line on each run and are not lost — an explicit `--since` reaches them — but the unanalysed count is no longer a useful health signal on its own.
+
+```
+INFO Analysis window: 16743 older unanalysed posts excluded from this run (predate 2026-08-06T17:02:15+00:00), still queued for a later run with an explicit --since
+```
 
 Typical log output:
 ```
@@ -326,6 +342,8 @@ python -m tg_compiler.main --batch --since 2026-06-07T06:00
 Accepted formats: `HH:MM` (today at that UTC time), `YYYY-MM-DD` (midnight on that date), `YYYY-MM-DDTHH:MM` (exact UTC datetime).
 
 **`--since` resets channel cursors** so the scraper re-fetches from Telegram. Already-seen posts hit the `UNIQUE(channel_id, message_id)` constraint and are silently discarded — no duplicate DB entries. Already-analysed posts are skipped by `get_unanalysed_posts()` — no LLM calls are wasted. The downside is Telegram still has to serve those message pages, which wastes API quota.
+
+**`--since` overrides the analysis window in both directions.** It replaces the derived cutoff outright, so `--since 2026-06-01` reaches back past `analysis_lookback_days` and `--since 08:00` narrows the run to today. It also overrides the cap on `lookback_seconds`, since it is an explicit statement of intent.
 
 > **Use `--since` only when you intentionally need a historical lookback.** For routine same-day re-runs, use plain `--batch` — it uses the cursor and fetches only messages that arrived since the last run.
 
@@ -603,7 +621,7 @@ Each `--batch` or `--generate` run writes a new uniquely timestamped PDF. The `.
 - *Emerging Actors / Topics* — entities mentioned today but absent from the prior 7 days (shown once a baseline exists)
 
 **Lead Reports** — the day's most important stories in full detail. Every CRITICAL-rated item is guaranteed a slot regardless of its score (even one that scored into In Brief), topped up with the highest-scoring remaining reports to at least 10 — never truncating criticals, so the section grows when criticals alone exceed 10. Cross-channel reports of the same story (detected by word overlap, or shared named entities with alias normalisation so "U.S."/"US"/"United States" match) are clustered: the highest-scoring report appears, with a **"Corroborated by N other channels"** line linking to the duplicates (N counts distinct other channels; repeat posts from the story's own channel are listed separately as "Related posts from this channel" and don't inflate the count), and cross-channel corroboration boosts the story's score. Each entry shows:
-- **Threat level badge**: ■ CRITICAL (red) · ■ HIGH (orange) · ■ MODERATE (amber) · ■ LOW (green)
+- **Threat level badge**: 🟥 CRITICAL · 🟧 HIGH · 🟨 MODERATE · 🟩 LOW
 - **Category** in backtick style: `` `Breaking News` `` / `` `Analysis` `` / `` `Official Statement` `` / `` `Rumor` `` / `` `Media` `` / `` `Other` ``
 - LLM-generated headline title (5-10 words)
 - Channel, post timestamp, and direct link to the original Telegram post (↗ t.me)
@@ -625,12 +643,14 @@ Each story appears in exactly one section — lead stories are not repeated belo
 
 ### Threat level scale
 
+In the PDF these are coloured square glyphs (`#c0392b`, `#d35400`, `#b7950b`, `#1e8449`).
+
 | Badge | Level | Meaning |
 |---|---|---|
-| ■ red | CRITICAL | Imminent risk of mass casualties, confirmed state-level military action underway, nuclear/chemical/biological threat, or active attack on critical infrastructure |
-| ■ orange | HIGH | Confirmed armed conflict development, significant political crisis, major terror attack, or credible escalation warning from a named senior state official |
-| ■ amber | MODERATE | Ongoing conflict updates, diplomatic developments, significant arrests or detentions, or unverified but plausible escalation claims |
-| ■ green | LOW | Background context, routine troop movement reports, unverified rumours, social media content, statistical or historical reports |
+| 🟥 | CRITICAL | Imminent risk of mass casualties, confirmed state-level military action underway, nuclear/chemical/biological threat, or active attack on critical infrastructure |
+| 🟧 | HIGH | Confirmed armed conflict development, significant political crisis, major terror attack, or credible escalation warning from a named senior state official |
+| 🟨 | MODERATE | Ongoing conflict updates, diplomatic developments, significant arrests or detentions, or unverified but plausible escalation claims |
+| 🟩 | LOW | Background context, routine troop movement reports, unverified rumours, social media content, statistical or historical reports |
 
 ### Composite scoring formula
 
@@ -672,6 +692,12 @@ Either no posts were scraped today, or LM Studio analysis has not run yet. Run `
 
 **Intelligence front page not prepended**  
 If LM Studio was unreachable during the synthesis step, a warning is logged and the briefing is kept as-is. Check LM Studio is running and retry with `--analyse`.
+
+**"Could not read image … No such file or directory" while analysing**  
+Should no longer appear. The path exists in the database but the file was purged by `retention_days` or never downloaded; the analyzer now filters absent paths before building the prompt, and `--batch` re-downloads what it can first. If you do see it, the file exists but cannot be decoded (a truncated download) — it is logged at DEBUG and the post is analysed as text-only.
+
+**The unanalysed post count keeps growing**  
+Expected. Posts older than `storage.analysis_lookback_days` are skipped by routine runs and stay queued; each run logs how many. To analyse them anyway, run `--batch --since <date>` — but note their media is already gone, so the result is text-only.
 
 **Session file issues after moving the project**  
 Delete `<session_name>.session` and re-authenticate by running `--batch` again.
