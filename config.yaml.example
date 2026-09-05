@@ -34,6 +34,78 @@ lmstudio:
   analysis_max_tokens: 4000         # hard ceiling on any single analysis call
   synthesis_max_tokens: 24000       # token budget for the intel front-page synthesis (keep generous: reasoning models deliberate before emitting JSON)
   max_concurrent_analyses: 1        # parallel LLM calls per batch run; increase if your hardware allows
+  # Batched analysis — several posts per LLM call. Reasoning models spend most of
+  # their output budget deliberating, and that cost is largely per *call*, so
+  # batching amortises it: measured on prism-ml/bonsai-27b, a batch of 10 spent
+  # 693 reasoning tokens per post against 3,515 when sent one at a time (39.6 vs
+  # 191 s/post). Images amortise far less (they dominate the prompt), hence the
+  # separate, smaller size for media-bearing posts. Both sizes at 1 = one post per
+  # call = the original behaviour.
+  # Only worth raising above 1 for a *reasoning* analysis model, whose per-call
+  # deliberation is what batching amortises. For a non-reasoning model a batch of
+  # 10 measured 1.7x faster while producing 36% shorter summaries and 36% fewer
+  # entities — see the Throughput section of README.md.
+  batch_size: 1                     # text-only posts per LLM call
+  batch_size_with_images: 1         # media-bearing posts per LLM call
+  batch_images_per_post: 1          # images attached per post inside a batch
+  #   budget = min(batch_base_tokens + posts * batch_tokens_per_post
+  #                + text_chars * batch_tokens_per_char
+  #                + images * batch_tokens_per_image, batch_max_tokens)
+  # Sized from measurement: a batch of 10 text posts spent 9,364 completion tokens
+  # on prism-ml/bonsai-27b, a batch of 3 image posts 7,668. Too small a budget shows
+  # up as finish_reason='length' and a partially salvaged batch in the logs.
+  batch_base_tokens: 4000           # flat reasoning allowance shared by the whole call
+  batch_tokens_per_post: 600        # JSON output allowance per post in the batch
+  batch_tokens_per_char: 0.3        # extra budget per character of batched prompt text
+  batch_tokens_per_image: 1200      # extra budget per image attached in a batch
+  batch_max_tokens: 32000           # hard ceiling on any batch call
+  batch_max_prompt_chars: 24000     # split a batch whose prompt text would exceed this
+  batch_min_yield_ratio: 0.6        # if a batch returns less than this fraction, retry its posts one by one
+  # Per-stage models. Analysis scores every scraped post and wants a small, fast,
+  # non-reasoning VLM; synthesis runs once over the whole triaged day and is where
+  # reasoning actually earns its cost. Both fall back to `model` when unset.
+  # analysis_model: "mistralai/ministral-3-3b"
+  # synthesis_model: "prism-ml/bonsai-27b"
+  # With manage_models on, the LM Studio SDK loads each stage's model at the stage
+  # boundary and unloads the previous one — necessary when the models cannot
+  # co-reside in VRAM (a 27B leaves ~4 GB free on a 16 GB card). It fails loudly
+  # if the SDK cannot reach LM Studio.
+  manage_models: false              # opt in to SDK-driven load/unload between stages
+  unload_others: true               # unload other loaded LLMs before loading a stage's model
+  model_ttl_seconds: 3600           # LM Studio unloads an idle model after this, so a crashed run strands nothing
+  # model_context_length: 32768     # optional load-time context override
+
+  # --- Per-run-mode analysis profiles ---
+  # --batch/--since select "batch"; --daemon selects "daemon";
+  # --analysis-profile NAME overrides either. Omit this block entirely and both
+  # modes just use the settings above, exactly as before.
+  #
+  # Why a profile rather than just a model name: token budgets, concurrency and
+  # context length have to match the model. A reasoning model needs a large
+  # analysis_base_tokens or its JSON is truncated mid-deliberation; a small model
+  # needs far less, and running several large-budget image requests at once will
+  # exhaust LM Studio's context. Keep each model's settings with the model.
+  #
+  # analysis_profiles:
+  #   batch:                          # whole-day catch-up: speed matters most
+  #     model: "mistralai/ministral-3-3b"
+  #     analysis_base_tokens: 700
+  #     analysis_tokens_per_image: 400
+  #     analysis_max_tokens: 1600
+  #     max_concurrent_analyses: 4
+  #     model_context_length: 32768
+  #     batch_size: 1                 # batching only pays off for a reasoning model
+  #     batch_size_with_images: 1
+  #   daemon:                         # live monitoring: quality matters more
+  #     model: "prism-ml/bonsai-27b"  # ideally the same as synthesis_model, or every
+  #                                   # sweep swaps weights around the nightly run
+  #     analysis_base_tokens: 9500
+  #     analysis_tokens_per_image: 12500
+  #     analysis_max_tokens: 16000
+  #     max_concurrent_analyses: 1
+  #     model_context_length: 32768
+  #     batch_size: 10                # a reasoning model needs batching to keep up
+  #     batch_size_with_images: 3
 
 triage:
   keywords: ["urgent", "breaking", "launch"]  # words that add keyword_boost to a post's score
@@ -72,3 +144,10 @@ storage:
   db_path: "./data/briefing.db"
   media_dir: "./data/media"
   retention_days: 30                # delete media older than this many days
+  # analysis_lookback_days: 30      # how far back --batch reaches for unanalysed posts,
+                                    # and the cap on lookback_seconds above.
+                                    # Defaults to retention_days. Setting it higher only
+                                    # buys text-only analyses: past retention_days the
+                                    # media those posts reference has already been deleted.
+                                    # Older unanalysed posts stay queued — reach them with
+                                    # an explicit --since, which overrides this window.

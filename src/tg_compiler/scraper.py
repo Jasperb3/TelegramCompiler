@@ -20,6 +20,13 @@ from tg_compiler.utils import connect_telegram_client, secure_file
 
 log = logging.getLogger(__name__)
 
+# Ceiling on re-downloads per --batch run. The repair pass only touches posts that
+# are both unanalysed and inside the analysis window, so steady state is a handful;
+# the cap exists so the first run after adopting the feature can't turn a long-
+# standing backlog of failed downloads into one enormous burst of API calls.
+MEDIA_REPAIR_MAX_PER_RUN = 200
+_MEDIA_REPAIR_IDS_PER_REQUEST = 100  # Telegram's own cap on get_messages(ids=[...])
+
 
 def media_path_for(base_dir: str, channel_slug: str, date_str: str, message_id: int, ext: str) -> str:
     p = Path(base_dir) / channel_slug / date_str
@@ -98,6 +105,74 @@ class Scraper:
 
     async def __aexit__(self, *_):
         await self._client.disconnect()
+
+    async def repair_missing_media(self, posts: list[PostRecord]) -> int:
+        """Re-download media for posts whose files are no longer on disk.
+
+        Two things leave a post referencing media the analyzer cannot see: a
+        download that permanently failed at scrape time (build_post_record keeps
+        has_images True with no path), and purge_old_media() deleting a date
+        directory the post still points at. Analysing such a post means analysing
+        it blind on its text, so inside the analysis window it is worth one more
+        fetch before falling back to text-only.
+
+        Returns the number of posts whose media_paths were repaired. Failures are
+        logged and skipped — a batch run must never abort here."""
+        candidates = [
+            p for p in posts
+            # An empty media_paths with has_images set is the failed-download case,
+            # so `not all(...)` on an empty list would wrongly exclude it.
+            if p.has_images
+            and (not p.media_paths or not all(Path(m).exists() for m in p.media_paths))
+        ]
+        if not candidates:
+            return 0
+
+        by_channel: dict[int, list[PostRecord]] = {}
+        for post in candidates[:MEDIA_REPAIR_MAX_PER_RUN]:
+            by_channel.setdefault(post.channel_id, []).append(post)
+
+        repaired = 0
+        for channel_id, channel_posts in by_channel.items():
+            channel_cfg = self.channel_map.get(channel_id)
+            if channel_cfg is None:
+                # Only channels scraped this run are resolvable; a post from a
+                # channel since removed from config has nothing to fetch against.
+                continue
+            try:
+                entity = await self._client.get_entity(channel_cfg.username or channel_cfg.id)
+                by_message_id = {p.message_id: p for p in channel_posts}
+                ids = list(by_message_id)
+                for start in range(0, len(ids), _MEDIA_REPAIR_IDS_PER_REQUEST):
+                    chunk = ids[start:start + _MEDIA_REPAIR_IDS_PER_REQUEST]
+                    for msg in await self._client.get_messages(entity, ids=chunk):
+                        # None means Telegram no longer has the message.
+                        if msg is None or not getattr(msg, "photo", None):
+                            continue
+                        post = by_message_id[msg.id]
+                        dest = media_path_for(
+                            self._cfg.storage.media_dir, channel_cfg.slug,
+                            msg.date.strftime("%Y-%m-%d"), msg.id, "jpg",
+                        )
+                        try:
+                            await self._client.download_media(msg, file=dest)
+                        except Exception as e:
+                            log.warning("Media repair failed for msg %s: %s", msg.id, e)
+                            Path(dest).unlink(missing_ok=True)
+                            continue
+                        self._db.update_post_media_paths(post.id, [dest])
+                        post.media_paths = [dest]
+                        repaired += 1
+                await asyncio.sleep(self._cfg.telegram.rate_limit_delay_ms / 1000)
+            except Exception as e:
+                log.warning("Media repair for channel %s failed: %s", channel_cfg.slug, e)
+
+        if len(candidates) > MEDIA_REPAIR_MAX_PER_RUN:
+            log.info(
+                "Media repair capped at %d of %d candidates this run",
+                MEDIA_REPAIR_MAX_PER_RUN, len(candidates),
+            )
+        return repaired
 
     async def scrape_channel(self, channel_cfg: ChannelConfig) -> list[PostRecord]:
         """Fetch and store new messages for one channel since its cursor, resolving

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import zoneinfo
+from datetime import datetime, timedelta
 from typing import Literal
 
 import yaml
@@ -32,6 +33,39 @@ class TelegramConfig(BaseModel):
     lookback_seconds: int = 604800  # how far back to fetch on first run (default: 1 week)
 
 
+class AnalysisProfile(BaseModel):
+    """Per-run-mode overrides for the analysis stage.
+
+    A model key alone is not portable between modes: token budgets, concurrency,
+    batch sizes and context length all have to match the model. bonsai-27b needs
+    analysis_base_tokens 9500 / max 16000 or its JSON is truncated mid-reasoning;
+    ministral-3-3b needs ~700/1600, and four concurrent image posts at bonsai's
+    budget exhausted LM Studio's context. So a profile carries the model *and*
+    the settings that must travel with it.
+
+    Every field is optional — a profile states only what differs from the
+    surrounding LMStudioConfig.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    model: str | None = None  # the analysis model; merged onto `analysis_model`
+    temperature: float | None = None
+    analysis_base_tokens: int | None = Field(default=None, gt=0)
+    analysis_tokens_per_char: float | None = Field(default=None, ge=0)
+    analysis_tokens_per_image: int | None = Field(default=None, ge=0)
+    analysis_max_tokens: int | None = Field(default=None, gt=0)
+    batch_size: int | None = Field(default=None, ge=1)
+    batch_size_with_images: int | None = Field(default=None, ge=1)
+    batch_images_per_post: int | None = Field(default=None, ge=1)
+    batch_base_tokens: int | None = Field(default=None, gt=0)
+    batch_tokens_per_post: int | None = Field(default=None, ge=0)
+    batch_tokens_per_char: float | None = Field(default=None, ge=0)
+    batch_tokens_per_image: int | None = Field(default=None, ge=0)
+    batch_max_tokens: int | None = Field(default=None, gt=0)
+    max_concurrent_analyses: int | None = Field(default=None, ge=1)
+    model_context_length: int | None = Field(default=None, gt=0)
+
+
 class LMStudioConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str
@@ -49,6 +83,65 @@ class LMStudioConfig(BaseModel):
     analysis_max_tokens: int = Field(default=4000, gt=0)         # hard ceiling on any single analysis call
     synthesis_max_tokens: int = 24000  # token budget for the intel front-page synthesis (large: reasoning models deliberate before emitting JSON)
     max_concurrent_analyses: int = 1  # parallel LLM calls; increase if LM Studio can handle it
+    # Batched analysis (see analyzer.plan_batches / analyze_batch). Several posts go
+    # into one LLM call, which amortises the mostly per-call reasoning burn across
+    # them. Both sizes default to 1 = one post per call = the pre-batching path.
+    batch_size: int = Field(default=1, ge=1)              # text-only posts per LLM call
+    batch_size_with_images: int = Field(default=1, ge=1)  # media-bearing posts per LLM call
+    batch_images_per_post: int = Field(default=1, ge=1)   # images attached per post in a batch
+    #   budget = min(batch_base_tokens + posts * batch_tokens_per_post
+    #                + text_chars * batch_tokens_per_char
+    #                + images * batch_tokens_per_image, batch_max_tokens)
+    # Defaults sized from measurement so a reasoning model doesn't truncate: a batch
+    # of 10 text posts spent 9,364 completion tokens on prism-ml/bonsai-27b, a batch
+    # of 3 image posts 7,668. max_tokens is a cap, not an allocation, so headroom
+    # costs a non-reasoning model nothing.
+    batch_base_tokens: int = Field(default=4000, gt=0)       # flat shared reasoning allowance per batch call
+    batch_tokens_per_post: int = Field(default=600, ge=0)    # per-post JSON output allowance
+    batch_tokens_per_char: float = Field(default=0.3, ge=0)  # per character of batched prompt text
+    batch_tokens_per_image: int = Field(default=1200, ge=0)  # per image attached in a batch
+    batch_max_tokens: int = Field(default=32000, gt=0)      # hard ceiling on any batch call
+    batch_max_prompt_chars: int = Field(default=24000, gt=0)  # split a batch whose prompt text exceeds this
+    batch_min_yield_ratio: float = Field(default=0.6, ge=0.0, le=1.0)  # below this, retry the batch's posts singly
+    # Per-stage models (see models.ModelManager). Analysis scores ~1,200 posts a day
+    # and wants a fast non-reasoning model; synthesis runs once over the whole
+    # triaged day and is where reasoning earns its cost. Either falls back to
+    # `model` when unset, so a single-model setup needs none of these.
+    analysis_model: str | None = None
+    synthesis_model: str | None = None
+    manage_models: bool = False        # opt in to SDK-driven load/unload at stage boundaries
+    unload_others: bool = True         # free VRAM by unloading other LLMs before loading a stage's model
+    model_ttl_seconds: int = Field(default=3600, gt=0)  # SDK TTL, so a crashed run can't strand a model
+    model_context_length: int | None = Field(default=None, gt=0)  # load-time context override
+    # Named per-run-mode analysis profiles: --batch/--since select "batch",
+    # --daemon selects "daemon", and --analysis-profile overrides either.
+    # Empty by default, so a config without them behaves exactly as before.
+    analysis_profiles: dict[str, AnalysisProfile] = Field(default_factory=dict)
+
+    def model_for(self, stage: str) -> str:
+        """The model key for a pipeline stage, falling back to `model`.
+
+        One helper for every call site so the fallback rule can't drift between
+        the analyzer and the synthesiser.
+        """
+        return getattr(self, f"{stage}_model", None) or self.model
+
+    def with_analysis_profile(self, name: str | None) -> "LMStudioConfig":
+        """Apply a named analysis profile, or return self unchanged.
+
+        Rebuilds the model rather than using model_copy(update=...): model_copy
+        skips validators, so a profile setting analysis_base_tokens above
+        analysis_max_tokens would slip past _validate_analysis_budget_bounds.
+        """
+        profile = self.analysis_profiles.get(name) if name else None
+        if profile is None:
+            return self
+        overrides = profile.model_dump(exclude_none=True)
+        # A profile's `model` is the *analysis* model; `model` itself stays the
+        # global fallback that synthesis uses.
+        if "model" in overrides:
+            overrides["analysis_model"] = overrides.pop("model")
+        return LMStudioConfig(**{**self.model_dump(), **overrides})
 
     @model_validator(mode="after")
     def _validate_analysis_budget_bounds(self) -> "LMStudioConfig":
@@ -56,6 +149,11 @@ class LMStudioConfig(BaseModel):
             raise ValueError(
                 f"analysis_base_tokens ({self.analysis_base_tokens}) must be <= "
                 f"analysis_max_tokens ({self.analysis_max_tokens})"
+            )
+        if self.batch_base_tokens > self.batch_max_tokens:
+            raise ValueError(
+                f"batch_base_tokens ({self.batch_base_tokens}) must be <= "
+                f"batch_max_tokens ({self.batch_max_tokens})"
             )
         return self
 
@@ -134,6 +232,20 @@ class StorageConfig(BaseModel):
     db_path: str = "./data/briefing.db"
     media_dir: str = "./data/media"
     retention_days: int = 30
+    # How far back --batch reaches for unanalysed posts, and the cap on the
+    # first-run/after-reset scrape lookback. Defaults to retention_days: past that
+    # point purge_old_media() has already deleted the media a post references, so
+    # analysing it means analysing it blind on its text alone.
+    analysis_lookback_days: int | None = Field(default=None, gt=0)
+
+    def analysis_lookback_days_effective(self) -> int:
+        """The analysis window in days — analysis_lookback_days, or retention_days
+        when it is unset. The fallback lives here so main.py and the scrape-lookback
+        cap can't drift apart."""
+        return self.analysis_lookback_days if self.analysis_lookback_days is not None else self.retention_days
+
+    def analysis_cutoff(self, now: datetime) -> datetime:
+        return now - timedelta(days=self.analysis_lookback_days_effective())
 
 
 class AppConfig(BaseModel):
@@ -143,6 +255,19 @@ class AppConfig(BaseModel):
     triage: TriageConfig = Field(default_factory=TriageConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+
+    def with_analysis_profile(self, name: str | None) -> "AppConfig":
+        """This config with a named analysis profile applied to `lmstudio`.
+
+        Resolved once at CLI dispatch and passed to run_batch/run_daemon, so every
+        downstream reader of `config.lmstudio` — token budgets, batch sizes,
+        concurrency, the model key and the model_used provenance — follows without
+        any further plumbing.
+        """
+        resolved = self.lmstudio.with_analysis_profile(name)
+        if resolved is self.lmstudio:
+            return self
+        return self.model_copy(update={"lmstudio": resolved})
 
     def channel_priority_map(self) -> dict[str, float]:
         return {ch.slug: ch.priority for ch in self.telegram.channels}

@@ -315,3 +315,154 @@ async def test_daemon_and_batch_inserts_collide_on_unique(db):
     second = db.insert_post(record)
     assert first is not None
     assert second is None  # UNIQUE(channel_id, message_id) blocks the duplicate
+
+
+# --- media repair -------------------------------------------------------------
+
+def _repair_post(db, scraper_config, tmp_path, message_id, media_paths, has_images=True):
+    from datetime import datetime, timezone
+
+    from tg_compiler.db import PostRecord
+
+    rec = PostRecord(
+        channel_id=-100123, channel_name="bad_chan", message_id=message_id,
+        timestamp=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+        text="a post with a picture", media_paths=media_paths,
+        has_images=has_images, has_video=False, raw_json="{}",
+    )
+    rec.id = db.insert_post(rec)
+    return rec
+
+
+def _repair_scraper(db, scraper_config, monkeypatch, downloaded, messages=None, get_messages=None):
+    from telethon.tl.types import PeerChannel
+
+    scraper = Scraper(scraper_config, db)
+    scraper.channel_map[-100123] = scraper_config.telegram.channels[0]
+
+    async def fake_get_entity(_):
+        return PeerChannel(channel_id=123)
+
+    async def default_get_messages(entity, ids=None):
+        return [messages.get(i) for i in ids]
+
+    async def fake_download(msg, file=None):
+        Path(file).parent.mkdir(parents=True, exist_ok=True)
+        Path(file).write_bytes(b"jpeg")
+        downloaded.append(file)
+
+    monkeypatch.setattr(scraper._client, "get_entity", fake_get_entity)
+    monkeypatch.setattr(scraper._client, "get_messages", get_messages or default_get_messages)
+    monkeypatch.setattr(scraper._client, "download_media", fake_download)
+    return scraper
+
+
+class _FakeMsg:
+    def __init__(self, id):
+        from datetime import datetime, timezone
+
+        self.id = id
+        self.date = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        self.photo = object()
+
+
+async def test_repair_missing_media_redownloads_and_updates_paths(
+    db, scraper_config, tmp_path, monkeypatch
+):
+    scraper_config.storage.media_dir = str(tmp_path / "media")
+    post = _repair_post(db, scraper_config, tmp_path, 7, [str(tmp_path / "gone.jpg")])
+    downloaded = []
+    scraper = _repair_scraper(db, scraper_config, monkeypatch, downloaded, {7: _FakeMsg(7)})
+
+    assert await scraper.repair_missing_media([post]) == 1
+    assert len(downloaded) == 1
+    stored = db.get_post(post.id).media_paths
+    assert stored == downloaded
+    assert Path(stored[0]).exists()
+
+
+async def test_repair_missing_media_retries_a_post_whose_download_never_succeeded(
+    db, scraper_config, tmp_path, monkeypatch
+):
+    """build_post_record leaves has_images=True with no paths when a download
+    permanently fails — that post is worth retrying."""
+    scraper_config.storage.media_dir = str(tmp_path / "media")
+    post = _repair_post(db, scraper_config, tmp_path, 8, [])
+    downloaded = []
+    scraper = _repair_scraper(db, scraper_config, monkeypatch, downloaded, {8: _FakeMsg(8)})
+
+    assert await scraper.repair_missing_media([post]) == 1
+    assert db.get_post(post.id).media_paths == downloaded
+
+
+async def test_repair_missing_media_skips_posts_whose_files_are_present(
+    db, scraper_config, tmp_path, monkeypatch
+):
+    present = tmp_path / "there.jpg"
+    present.write_bytes(b"jpeg")
+    post = _repair_post(db, scraper_config, tmp_path, 9, [str(present)])
+    downloaded = []
+    scraper = _repair_scraper(db, scraper_config, monkeypatch, downloaded, {9: _FakeMsg(9)})
+
+    assert await scraper.repair_missing_media([post]) == 0
+    assert downloaded == []
+
+
+async def test_repair_missing_media_skips_a_deleted_message(
+    db, scraper_config, tmp_path, monkeypatch
+):
+    scraper_config.storage.media_dir = str(tmp_path / "media")
+    post = _repair_post(db, scraper_config, tmp_path, 10, [str(tmp_path / "gone.jpg")])
+    downloaded = []
+    scraper = _repair_scraper(db, scraper_config, monkeypatch, downloaded, {10: None})
+
+    assert await scraper.repair_missing_media([post]) == 0
+    assert downloaded == []
+    assert db.get_post(post.id).media_paths == [str(tmp_path / "gone.jpg")]
+
+
+async def test_repair_missing_media_honours_the_per_run_cap(
+    db, scraper_config, tmp_path, monkeypatch
+):
+    import tg_compiler.scraper as scraper_mod
+
+    scraper_config.storage.media_dir = str(tmp_path / "media")
+    monkeypatch.setattr(scraper_mod, "MEDIA_REPAIR_MAX_PER_RUN", 2)
+    posts = [
+        _repair_post(db, scraper_config, tmp_path, i, [str(tmp_path / f"gone{i}.jpg")])
+        for i in range(20, 25)
+    ]
+    downloaded = []
+    scraper = _repair_scraper(
+        db, scraper_config, monkeypatch, downloaded, {p.message_id: _FakeMsg(p.message_id) for p in posts}
+    )
+
+    assert await scraper.repair_missing_media(posts) == 2
+    assert len(downloaded) == 2
+
+
+async def test_repair_missing_media_survives_a_failing_channel(
+    db, scraper_config, tmp_path, monkeypatch
+):
+    scraper_config.storage.media_dir = str(tmp_path / "media")
+    post = _repair_post(db, scraper_config, tmp_path, 11, [str(tmp_path / "gone.jpg")])
+    downloaded = []
+
+    async def boom(entity, ids=None):
+        raise RuntimeError("flood")
+
+    scraper = _repair_scraper(db, scraper_config, monkeypatch, downloaded, get_messages=boom)
+
+    assert await scraper.repair_missing_media([post]) == 0
+
+
+async def test_repair_missing_media_ignores_posts_from_unknown_channels(
+    db, scraper_config, tmp_path, monkeypatch
+):
+    post = _repair_post(db, scraper_config, tmp_path, 12, [str(tmp_path / "gone.jpg")])
+    downloaded = []
+    scraper = _repair_scraper(db, scraper_config, monkeypatch, downloaded, {12: _FakeMsg(12)})
+    scraper.channel_map.clear()
+
+    assert await scraper.repair_missing_media([post]) == 0
+    assert downloaded == []

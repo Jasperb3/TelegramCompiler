@@ -5,7 +5,6 @@ import asyncio
 import logging
 import os
 import shutil
-import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -26,6 +25,7 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 HEARTBEAT_INTERVAL_SECS = 3600  # daemon logs stored/analysed counts on this cadence
+DAEMON_ANALYSIS_INTERVAL_SECS = 600  # daemon sweeps newly stored posts for analysis on this cadence
 
 
 def _share_pdf(config: AppConfig, pdf_path: Path) -> None:
@@ -71,13 +71,19 @@ async def generate_daily_briefing(
     return path, content
 
 
-async def run_batch(config: AppConfig) -> None:
+async def run_batch(config: AppConfig, since_dt: datetime | None = None) -> None:
     from tg_compiler.analyzer import Analyzer
     from tg_compiler.synthesiser import run_analysis
 
     db = Database(config.storage.db_path)
     db.init_schema()
     today = datetime.now(timezone.utc).date()
+
+    # Without --since, analysis reaches back exactly as far as media is kept: past
+    # that point purge_old_media() has deleted the images a post references, so the
+    # model would be analysing it blind on its text. Older unanalysed posts stay
+    # queued and are recoverable with an explicit --since, which wins outright.
+    cutoff = since_dt or config.storage.analysis_cutoff(datetime.now(timezone.utc))
 
     total_scraped = 0
     from tqdm import tqdm
@@ -92,9 +98,13 @@ async def run_batch(config: AppConfig) -> None:
                 except Exception as e:
                     log.error("Scraping channel %s failed: %s", channel_cfg.slug, e)
         channel_map = scraper.channel_map
+        # Still inside the Scraper context: repair runs on the connected client.
+        repaired = await scraper.repair_missing_media(db.get_unanalysed_posts(since=cutoff))
+        if repaired:
+            log.info("Repaired media for %d posts", repaired)
 
     analyzer = Analyzer(config, db)
-    analysed_count, skipped_count = await analyzer.process_unanalysed(channel_map)
+    analysed_count, skipped_count = await analyzer.process_unanalysed(channel_map, since=cutoff)
     log.info("Analysed %d posts (skipped %d)", analysed_count, skipped_count)
 
     path, content = await generate_daily_briefing(
@@ -183,19 +193,18 @@ async def schedule_daily_generation(config: AppConfig) -> None:
 
 
 async def run_daemon(config: AppConfig) -> None:
-    from openai import APIConnectionError
     from telethon import TelegramClient, events
     from telethon import utils as telethon_utils
 
-    from tg_compiler.analyzer import Analyzer, analysis_to_record
+    from tg_compiler.analyzer import Analyzer
     from tg_compiler.scraper import build_post_record
 
     db = Database(config.storage.db_path)
     db.init_schema()
     analyzer = Analyzer(config, db)
-    analysis_sem = asyncio.Semaphore(config.lmstudio.max_concurrent_analyses)
-    last_probe_failure: float | None = None
-    PROBE_BACKOFF_SECS = 60
+    # Live posts are stored on arrival and analysed by the periodic sweep below,
+    # never inline — see _analysis_sweep.
+    started_at = datetime.now(timezone.utc)
     stored_count = 0
     analysed_count = 0
 
@@ -226,7 +235,7 @@ async def run_daemon(config: AppConfig) -> None:
 
         @client.on(events.NewMessage(chats=channel_entities))
         async def handle_new_message(event):
-            nonlocal last_probe_failure, stored_count, analysed_count
+            nonlocal stored_count
             msg = event.message
             channel_id = event.chat_id
             channel_cfg = channel_cfg_by_id.get(channel_id)
@@ -234,35 +243,52 @@ async def run_daemon(config: AppConfig) -> None:
                 log.warning("Received message from unmapped channel %s — skipping", channel_id)
                 return
             record = await build_post_record(client, msg, channel_id, channel_cfg, config.storage)
-            post_id = db.insert_post(record)
+            db.insert_post(record)  # returns None on duplicate; the sweep picks it up either way
             # Advance the per-channel cursor so a later --batch resumes from here
             # instead of re-walking everything the daemon already captured. Guard
             # with max() so out-of-order live events never rewind it.
             if msg.id > db.get_last_seen_id(channel_id):
                 db.set_last_seen_id(channel_id, msg.id)
-            analysed = False
-            if post_id is not None:
-                record.id = post_id
-                if (
-                    last_probe_failure is not None
-                    and time.monotonic() - last_probe_failure < PROBE_BACKOFF_SECS
-                ):
-                    log.debug("LM Studio recently unreachable — post %s left queued", msg.id)
-                else:
-                    try:
-                        async with analysis_sem:
-                            analysis = await analyzer.analyze_post(record, channel_cfg)
-                        db.insert_analysis(analysis_to_record(post_id, analysis, config.lmstudio.model))
-                        last_probe_failure = None
-                        analysed = True
-                    except Exception as e:
-                        log.error("Analysis failed for post %s: %s", msg.id, e)
-                        if isinstance(e, APIConnectionError):
-                            last_probe_failure = time.monotonic()
             stored_count += 1
-            if analysed:
-                analysed_count += 1
-            log.debug("Stored post %s from %s%s", msg.id, channel_cfg.slug, " (analysed)" if analysed else "")
+            log.debug("Stored post %s from %s", msg.id, channel_cfg.slug)
+
+        async def _analysis_sweep() -> None:
+            """Analyse posts stored since the daemon started, in batches.
+
+            A reasoning model cannot keep up post-by-post at this volume (bonsai-27b
+            is ~26-40 h/day of work for 1,100-1,700 posts one at a time, against
+            ~7 h/day batched), so the daemon buffers naturally in the database and
+            sweeps periodically. process_unanalysed() already brings batching, the
+            content-gate, the LM Studio preflight probe, the per-post fallback
+            ladder and ModelManager.ensure() — the last of which the old inline
+            path never called, so live analysis used to fire at whichever model the
+            nightly synthesis had left loaded.
+
+            Scoped with `since` to the daemon's own start: unscoped it would sweep
+            up every unanalysed post ever stored (~92k in the live database).
+            --batch remains the tool for historical catch-up.
+            """
+            nonlocal analysed_count
+            while True:
+                await asyncio.sleep(DAEMON_ANALYSIS_INTERVAL_SECS)
+                try:
+                    analysed, skipped = await analyzer.process_unanalysed(
+                        channel_cfg_by_id, since=started_at
+                    )
+                except Exception:
+                    log.exception("Analysis sweep failed — retrying next cycle")
+                    continue
+                analysed_count += analysed
+                if analysed or skipped:
+                    log.info("Analysis sweep: %d analysed, %d skipped", analysed, skipped)
+
+        sweep_task = asyncio.create_task(_analysis_sweep())
+
+        def _on_sweep_done(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                log.error("Daemon analysis sweep crashed", exc_info=task.exception())
+
+        sweep_task.add_done_callback(_on_sweep_done)
 
         scheduler_task = asyncio.create_task(schedule_daily_generation(config))
 
@@ -325,6 +351,13 @@ def main() -> None:
              "Resets channel cursors and overrides lookback_seconds.",
     )
     parser.add_argument(
+        "--analysis-profile",
+        metavar="NAME",
+        default=None,
+        help="Analysis profile from lmstudio.analysis_profiles. Defaults to 'batch' "
+             "for --batch/--since and 'daemon' for --daemon.",
+    )
+    parser.add_argument(
         "--layout",
         choices=["desktop", "mobile"],
         default=None,
@@ -339,8 +372,42 @@ def main() -> None:
     cfg = load_config(args.config, env_override=True)
     os.makedirs(cfg.storage.media_dir, exist_ok=True)
 
+    # --batch/--since and --daemon want different analysis models, and each model
+    # needs its own token budgets, concurrency and context length alongside it.
+    default_profile = "daemon" if args.daemon else "batch" if args.batch else None
+    profile_name = args.analysis_profile or default_profile
+    if args.analysis_profile and args.analysis_profile not in cfg.lmstudio.analysis_profiles:
+        raise SystemExit(
+            f"Unknown analysis profile {args.analysis_profile!r}. "
+            f"Configured profiles: {sorted(cfg.lmstudio.analysis_profiles) or '(none)'}"
+        )
+    if profile_name:
+        if profile_name in cfg.lmstudio.analysis_profiles:
+            cfg = cfg.with_analysis_profile(profile_name)
+            log.info(
+                "Analysis profile %r: model=%s batch=%d/%d concurrency=%d",
+                profile_name, cfg.lmstudio.model_for("analysis"),
+                cfg.lmstudio.batch_size, cfg.lmstudio.batch_size_with_images,
+                cfg.lmstudio.max_concurrent_analyses,
+            )
+        else:
+            log.debug("No %r analysis profile configured — using lmstudio settings as-is",
+                      profile_name)
+
     if args.layout:
         cfg.generation.pdf_layout = args.layout
+
+    # The scrape lookback (used on first run / after a cursor reset) is capped at
+    # the same window, so a reset can't pull in months of history whose media will
+    # never exist. An explicit --since below deliberately overrides this.
+    window_secs = cfg.storage.analysis_lookback_days_effective() * 86400
+    if cfg.telegram.lookback_seconds > window_secs:
+        log.info(
+            "Capping lookback_seconds %d -> %d (analysis window is %d days)",
+            cfg.telegram.lookback_seconds, window_secs,
+            cfg.storage.analysis_lookback_days_effective(),
+        )
+        cfg.telegram.lookback_seconds = window_secs
 
     since_dt = None
     if args.since:
@@ -356,7 +423,7 @@ def main() -> None:
             log.info("--since %s: lookback set to %ds, all channel cursors reset", args.since, cfg.telegram.lookback_seconds)
 
     if args.batch:
-        asyncio.run(run_batch(cfg))
+        asyncio.run(run_batch(cfg, since_dt))
     elif args.daemon:
         asyncio.run(run_daemon(cfg))
     elif args.analyse:

@@ -1,0 +1,316 @@
+#!/usr/bin/env python
+"""Benchmark analysis throughput across models and batch sizes.
+
+Needs a live LM Studio and a populated database; it is a development tool and is
+never imported by the package or exercised by pytest. It only reads the DB.
+
+    python scripts/bench_analysis.py --models prism-ml/bonsai-27b --batch-sizes 1,5,10
+    python scripts/bench_analysis.py --models a,b --batch-sizes 10 --with-images
+
+The post sample is drawn once with a fixed seed and cached in
+scripts/bench_sample.json, so every model and batch size is scored on identical
+input and runs stay comparable across sessions.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import statistics
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from openai import LengthFinishReasonError, OpenAI  # noqa: E402
+
+from tg_compiler import analyzer as A  # noqa: E402
+from tg_compiler.config import load_config  # noqa: E402
+from tg_compiler.db import Database  # noqa: E402
+from tg_compiler.models import ModelManager  # noqa: E402
+
+SCORES = ("importance", "urgency", "credibility", "relevance")
+
+SAMPLE_FILE = Path(__file__).with_name("bench_sample.json")
+SAMPLE_SEED = 20260903
+
+
+def build_sample(db: Database, n_text: int, n_images: int) -> dict:
+    """Draw a reproducible stratified sample of message ids."""
+    posts = db.get_unanalysed_posts()
+    text = [
+        p for p in posts
+        if not p.media_paths and 200 <= len(p.text.strip()) <= 1200
+    ]
+    media = [
+        p for p in posts
+        if p.media_paths and all(Path(x).exists() for x in p.media_paths)
+        and len(p.text.strip()) >= A.MIN_CONTENT_CHARS
+    ]
+    rng = random.Random(SAMPLE_SEED)
+    rng.shuffle(text)
+    rng.shuffle(media)
+    return {
+        "seed": SAMPLE_SEED,
+        "text": [[p.channel_id, p.message_id] for p in text[:n_text]],
+        "images": [[p.channel_id, p.message_id] for p in media[:n_images]],
+    }
+
+
+def load_sample(db: Database, n_text: int, n_images: int) -> dict:
+    if not SAMPLE_FILE.exists():
+        SAMPLE_FILE.write_text(json.dumps(build_sample(db, n_text, n_images), indent=1))
+        print(f"Wrote a new sample to {SAMPLE_FILE}", file=sys.stderr)
+    sample = json.loads(SAMPLE_FILE.read_text())
+    by_key = {(p.channel_id, p.message_id): p for p in db.get_unanalysed_posts()}
+    resolve = lambda keys: [by_key[tuple(k)] for k in keys if tuple(k) in by_key]  # noqa: E731
+    return {"text": resolve(sample["text"]), "images": resolve(sample["images"])}
+
+
+def _usage(completion) -> tuple[int, int, int]:
+    u = completion.usage
+    reasoning = getattr(u.completion_tokens_details, "reasoning_tokens", 0) or 0
+    return u.prompt_tokens, u.completion_tokens, reasoning
+
+
+def run_cell(client, cfg, model: str, posts: list, batch_size: int,
+             manager: ModelManager | None = None) -> dict:
+    """Analyse `posts` at the given batch size and report timing and tokens.
+
+    Candidate models generally cannot co-reside in VRAM, so a manager is needed to
+    make each one resident before its cells run; load time is reported separately
+    from inference time so it never distorts s/post.
+    """
+    cfg = cfg.model_copy(update={"model": model, "batch_size": batch_size,
+                                 "batch_size_with_images": batch_size})
+    load_secs = 0.0
+    if manager is not None:
+        started = time.time()
+        manager.ensure(model)
+        load_secs = time.time() - started
+    batches = A.plan_batches(posts, cfg)
+    wall = prompt_t = completion_t = reasoning_t = 0.0
+    returned = aligned = misattributed = unverified = 0
+    finishes: dict[str, int] = {}
+    analyses: list[dict] = []
+
+    for batch in batches:
+        single = len(batch) == 1
+        if single:
+            messages = A.build_messages(batch[0], A.SYSTEM_PROMPT)
+            budget = A.compute_token_budget(batch[0], cfg)
+            schema = A.PostAnalysis
+        else:
+            messages = A.build_batch_messages(batch, A.SYSTEM_PROMPT, cfg)
+            budget = A.compute_batch_token_budget(batch, cfg)
+            schema = A.BatchAnalysis
+
+        started = time.time()
+        try:
+            completion = client.beta.chat.completions.parse(
+                model=model, messages=messages, response_format=schema,
+                temperature=cfg.temperature, max_tokens=budget,
+            )
+        except LengthFinishReasonError as e:
+            # .parse() raises rather than returning a response cut off at
+            # max_tokens; keep it so the cell reports what actually came back.
+            completion = e.completion
+            print(f"  batch of {len(batch)} hit the token limit — salvaging",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"  batch of {len(batch)} failed: {e}", file=sys.stderr)
+            continue
+        wall += time.time() - started
+
+        p_t, c_t, r_t = _usage(completion)
+        prompt_t += p_t
+        completion_t += c_t
+        reasoning_t += r_t
+        choice = completion.choices[0]
+        finishes[choice.finish_reason] = finishes.get(choice.finish_reason, 0) + 1
+
+        parsed = getattr(choice.message, "parsed", None)
+        if parsed is None and not single:
+            parsed = A.salvage_batch_items(choice.message.content or "")
+        if parsed is None:
+            continue
+        items = [parsed] if single else list(parsed.analyses)
+        returned += len(items)
+        for pos, item in enumerate(items):
+            post = batch[0] if single else batch[min(getattr(item, "index", pos + 1) - 1,
+                                                     len(batch) - 1)]
+            verdict = "match" if single else A.check_opening(
+                getattr(item, "opening", ""), post
+            )
+            if verdict == "match":
+                aligned += 1
+            elif verdict == "mismatch":
+                misattributed += 1
+            else:
+                unverified += 1
+            analyses.append({
+                "message_id": post.message_id,
+                "title": item.title, "summary": item.summary,
+                "category": item.category, "threat_level": item.threat_level,
+                "importance": item.importance_score, "urgency": item.urgency_score,
+                "credibility": item.credibility_score, "relevance": item.relevance_score,
+                "key_entities": item.key_entities,
+                "image_description": item.image_description or "",
+            })
+
+    n = len(posts)
+    return {
+        "model": model, "batch_size": batch_size, "posts": n, "returned": returned,
+        "aligned": aligned, "misattributed": misattributed, "unverified": unverified,
+        "wall": wall, "s_per_post": wall / n if n else 0.0,
+        "load_secs": load_secs,
+        "prompt_tokens": prompt_t, "completion_tokens": completion_t,
+        "reasoning_per_post": reasoning_t / n if n else 0.0,
+        "finish_reasons": finishes, "analyses": analyses,
+    }
+
+
+def richness(analyses: list[dict]) -> dict:
+    """How much substance each analysis carries.
+
+    Coverage and agreement can both look fine while batched summaries quietly get
+    shorter and lose entities or image insight, so measure that directly.
+    """
+    if not analyses:
+        return {"summary_chars": 0.0, "entities": 0.0, "image_rate": 0.0}
+    n = len(analyses)
+    return {
+        "summary_chars": sum(len(a["summary"]) for a in analyses) / n,
+        "entities": sum(len(a["key_entities"]) for a in analyses) / n,
+        "image_rate": sum(1 for a in analyses if a.get("image_description")) / n,
+    }
+
+
+def compare_analyses(reference: list[dict], candidate: list[dict]) -> dict | None:
+    """Agreement between two runs' analyses of the same posts.
+
+    Used both to check a candidate model against a reference model and to check
+    batched output against single-call output. Returns None when the two runs
+    share no posts.
+    """
+    a = {r["message_id"]: r for r in reference}
+    b = {r["message_id"]: r for r in candidate}
+    common = sorted(set(a) & set(b))
+    if not common:
+        return None
+    return {
+        "posts": len(common),
+        "category_agreement": sum(a[i]["category"] == b[i]["category"] for i in common) / len(common),
+        "threat_agreement": sum(
+            a[i]["threat_level"] == b[i]["threat_level"] for i in common
+        ) / len(common),
+        "score_deltas": {
+            s: sum(abs(a[i][s] - b[i][s]) for i in common) / len(common) for s in SCORES
+        },
+        "empty_summaries": {
+            "reference": sum(not a[i]["summary"].strip() for i in common),
+            "candidate": sum(not b[i]["summary"].strip() for i in common),
+        },
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--models", required=True, help="comma-separated LM Studio model ids")
+    ap.add_argument("--batch-sizes", default="1,5,10", help="comma-separated batch sizes")
+    ap.add_argument("--n-text", type=int, default=10)
+    ap.add_argument("--n-images", type=int, default=0)
+    ap.add_argument("--with-images", action="store_true",
+                    help="benchmark the image sample instead of the text sample")
+    ap.add_argument("--out", default="", help="write the raw per-cell JSON here")
+    ap.add_argument("--reference", default="",
+                    help="model id to treat as the quality reference for agreement")
+    args = ap.parse_args()
+
+    config = load_config(args.config)
+    db = Database(config.storage.db_path)
+    try:
+        sample = load_sample(db, args.n_text, max(args.n_images, 10 if args.with_images else 0))
+    finally:
+        db.close()
+    posts = sample["images"] if args.with_images else sample["text"]
+    if not posts:
+        sys.exit("Sample is empty — delete scripts/bench_sample.json and retry.")
+
+    lm = config.lmstudio
+    client = OpenAI(base_url=f"http://{lm.server_host}:{lm.server_port}/v1",
+                    api_key=lm.api_token or "lm-studio", timeout=3600, max_retries=0)
+
+    # Model management is what makes a multi-model benchmark possible at all:
+    # candidates rarely fit in VRAM together, so each must be made resident in turn.
+    manage = lm.model_copy(update={"manage_models": True})
+    cells = []
+    with ModelManager(manage) as manager:
+        for model in args.models.split(","):
+            for size in (int(s) for s in args.batch_sizes.split(",")):
+                print(f"running {model} @ batch {size} over {len(posts)} posts…",
+                      file=sys.stderr)
+                cells.append(run_cell(client, lm, model.strip(), posts, size, manager))
+
+    print(f"\n{len(posts)} posts, {'with images' if args.with_images else 'text-only'}\n")
+    print("| model | batch | s/post | load s | returned | aligned | misattrib | unverified "
+          "| reasoning tok/post | completion tok | finish |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for c in cells:
+        print(f"| {c['model']} | {c['batch_size']} | {c['s_per_post']:.1f} | "
+              f"{c['load_secs']:.0f} | {c['returned']}/{c['posts']} | {c['aligned']} | "
+              f"{c['misattributed']} | {c['unverified']} | {c['reasoning_per_post']:.0f} | "
+              f"{c['completion_tokens']:.0f} | {c['finish_reasons']} |")
+
+    if args.reference:
+        ref = next((c for c in cells if c["model"] == args.reference), None)
+        if ref is None:
+            print(f"\nreference model {args.reference} was not benchmarked", file=sys.stderr)
+        else:
+            print(f"\nagreement against {args.reference}:")
+            for c in cells:
+                if c is ref:
+                    continue
+                cmp = compare_analyses(ref["analyses"], c["analyses"])
+                if cmp is None:
+                    print(f"  {c['model']} @ {c['batch_size']}: no shared posts")
+                    continue
+                deltas = " ".join(f"{k[:4]} {v:.2f}" for k, v in cmp["score_deltas"].items())
+                print(f"  {c['model']} @ batch {c['batch_size']}: "
+                      f"category {cmp['category_agreement']:.0%}, "
+                      f"threat {cmp['threat_agreement']:.0%}, |Δ| {deltas}")
+
+    print("\n| model | batch | coverage | mean summary chars | mean entities | image-insight rate |")
+    print("|---|---|---|---|---|---|")
+    for c in cells:
+        r = richness(c["analyses"])
+        print(f"| {c['model']} | {c['batch_size']} | {c['returned']}/{c['posts']} | "
+              f"{r['summary_chars']:.0f} | {r['entities']:.1f} | {r['image_rate']:.0%} |")
+
+    bad = [c for c in cells if c["misattributed"]]
+    if bad:
+        print("\n*** MISATTRIBUTION — these models attached analyses to the wrong posts:")
+        for c in bad:
+            print(f"  {c['model']} @ batch {c['batch_size']}: {c['misattributed']} of "
+                  f"{c['returned']} returned items described a different post")
+    if any(c["unverified"] for c in cells):
+        print("\n(unverified = no opening anchor returned, so alignment could not be checked "
+              "— not evidence of misattribution)")
+
+    if len(cells) > 1:
+        best = min(cells, key=lambda c: c["s_per_post"])
+        worst = max(cells, key=lambda c: c["s_per_post"])
+        print(f"\nfastest: {best['model']} @ batch {best['batch_size']} — "
+              f"{worst['s_per_post'] / best['s_per_post']:.1f}x over the slowest cell")
+        print(f"median s/post across cells: "
+              f"{statistics.median(c['s_per_post'] for c in cells):.1f}")
+
+    if args.out:
+        Path(args.out).write_text(json.dumps(cells, indent=1))
+        print(f"\nraw results → {args.out}")
+
+
+if __name__ == "__main__":
+    main()

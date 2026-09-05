@@ -14,6 +14,7 @@ from openai import OpenAI
 
 from tg_compiler.config import AppConfig
 from tg_compiler.db import Database
+from tg_compiler.models import ModelManager
 from tg_compiler.trends import TREND_WINDOW_DAYS, compute_trends
 from tg_compiler.utils import escape_html
 
@@ -139,7 +140,7 @@ async def synthesise(config: AppConfig, posts: list[dict], trends: dict | None =
     try:
         response = await asyncio.to_thread(
             lambda: client.chat.completions.create(
-                model=cfg.model,
+                model=cfg.model_for("synthesis"),
                 messages=[
                     {"role": "system", "content": _SYNTHESIS_SYSTEM},
                     {"role": "user", "content": user_message},
@@ -392,6 +393,8 @@ async def run_analysis(
         previous_intel = db.get_intel_assessment((target_date - timedelta(days=1)).isoformat())
 
         log.info("Synthesising intelligence assessment from %d posts…", len(posts))
+        with ModelManager(config.lmstudio) as manager:
+            await asyncio.to_thread(manager.ensure, config.lmstudio.model_for("synthesis"))
         intel = await synthesise(config, posts, trends=trends, previous_intel=previous_intel)
         if intel is None:
             return

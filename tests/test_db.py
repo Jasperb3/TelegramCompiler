@@ -57,6 +57,77 @@ def test_get_unanalysed_posts(db, sample_post):
     assert any(p.id == post_id for p in unanalysed)
 
 
+def test_get_unanalysed_posts_since_excludes_older_posts(db, sample_post):
+    from dataclasses import replace
+
+    old_post = replace(sample_post, message_id=1, timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc))
+    new_post = replace(sample_post, message_id=2, timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc))
+    db.insert_post(old_post)
+    new_id = db.insert_post(new_post)
+
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    unanalysed = db.get_unanalysed_posts(since=cutoff)
+
+    assert [p.id for p in unanalysed] == [new_id]
+
+
+def test_get_unanalysed_posts_since_boundary_inclusive(db, sample_post):
+    from dataclasses import replace
+
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    boundary_post = replace(sample_post, message_id=3, timestamp=cutoff)
+    boundary_id = db.insert_post(boundary_post)
+
+    unanalysed = db.get_unanalysed_posts(since=cutoff)
+
+    assert any(p.id == boundary_id for p in unanalysed)
+
+
+def test_count_unanalysed_posts(db, sample_post):
+    from dataclasses import replace
+
+    db.insert_post(replace(sample_post, message_id=1))
+    db.insert_post(replace(sample_post, message_id=2))
+
+    assert db.count_unanalysed_posts() == 2
+
+
+def test_count_unanalysed_posts_since_excludes_older_posts(db, sample_post):
+    from dataclasses import replace
+
+    db.insert_post(replace(sample_post, message_id=1, timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+    db.insert_post(replace(sample_post, message_id=2, timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc)))
+
+    assert db.count_unanalysed_posts(since=datetime(2026, 6, 5, tzinfo=timezone.utc)) == 1
+
+
+def test_count_unanalysed_posts_since_boundary_inclusive(db, sample_post):
+    from dataclasses import replace
+
+    cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    db.insert_post(replace(sample_post, message_id=3, timestamp=cutoff))
+
+    assert db.count_unanalysed_posts(since=cutoff) == 1
+
+
+def test_get_unanalysed_posts_orders_oldest_first(db, sample_post):
+    from dataclasses import replace
+
+    db.insert_post(replace(sample_post, message_id=1, timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc)))
+    db.insert_post(replace(sample_post, message_id=2, timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+
+    assert [p.message_id for p in db.get_unanalysed_posts()] == [2, 1]
+
+
+def test_get_unanalysed_posts_limit_takes_the_oldest(db, sample_post):
+    from dataclasses import replace
+
+    db.insert_post(replace(sample_post, message_id=1, timestamp=datetime(2026, 6, 10, tzinfo=timezone.utc)))
+    db.insert_post(replace(sample_post, message_id=2, timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+
+    assert [p.message_id for p in db.get_unanalysed_posts(limit=1)] == [2]
+
+
 def test_insert_analysis_and_joined_query(db, sample_post):
     post_id = db.insert_post(sample_post)
     rec = AnalysisRecord(
@@ -227,3 +298,9 @@ def test_init_schema_dedupes_pre_existing_duplicate_analyses(tmp_path):
     assert len(rows) == 1
     assert rows[0]["summary"] == "first"
     database.close()
+
+
+def test_update_post_media_paths_round_trips(db, sample_post):
+    post_id = db.insert_post(sample_post)
+    db.update_post_media_paths(post_id, ["a/b/1.jpg", "a/b/2.jpg"])
+    assert db.get_post(post_id).media_paths == ["a/b/1.jpg", "a/b/2.jpg"]

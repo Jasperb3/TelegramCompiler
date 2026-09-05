@@ -1,0 +1,226 @@
+# Datasette configuration for browsing data/briefing.db.
+#
+#   source .venv/bin/activate
+#   datasette data/briefing.db -m scripts/datasette_metadata.yaml
+#
+# Datasette opens the file through a `file:...?mode=ro` URI, so nothing here can
+# mutate the database while --batch/--daemon are writing to it. Never pass
+# -i/--immutable against the live DB: that asserts the file never changes, which
+# is false during a run, and yields incorrect reads instead of a clean error.
+#
+# This file adds no views and no schema of any kind — init_schema() is unaffected.
+title: The Daily Telegram — briefing database
+description_html: |-
+  Read-only inspection of the scrape/analysis database. <code>analyses.category =
+  'Skipped'</code> is the analyzer's content-gate sentinel and is excluded from the
+  browsing queries, the same way <code>triage.py</code> excludes it.
+
+# datasette-media serves the scraped images at /-/media/photo/<post id>.
+# This SQL is the security boundary: it can only ever resolve a path already
+# recorded in posts.media_paths, never an arbitrary file. The stored paths are
+# relative, so Datasette must be launched from the project root.
+plugins:
+  datasette-media:
+    photo:
+      database: briefing
+      sql: |-
+        select json_extract(media_paths, '$[0]') as filepath
+        from posts
+        where id = :key and json_array_length(media_paths) = 1
+
+databases:
+  briefing:
+    tables:
+      posts:
+        facets: [channel_name, has_images, has_video]
+        sort_desc: timestamp
+      analyses:
+        facets: [category, threat_level, model_used]
+        sort_desc: processed_at
+
+    queries:
+      analysed_posts:
+        title: Analysed posts (joined)
+        description: >-
+          Every analysis with its source post. Leave a filter blank to ignore it.
+          Channel is an exact match (e.g. WarFrontWitness); since is a date or an
+          ISO-8601 prefix (e.g. 2026-09-01).
+        sql: |-
+          select
+            p.channel_name,
+            p.timestamp,
+            a.title,
+            a.category,
+            a.threat_level,
+            a.importance_score,
+            a.urgency_score,
+            a.credibility_score,
+            a.relevance_score,
+            a.summary,
+            a.key_entities,
+            a.image_insights,
+            a.model_used,
+            p.id as post_id,
+            p.message_id,
+            case when tme_link(p.channel_name, p.message_id) is null then null
+                 else json_object('href', tme_link(p.channel_name, p.message_id),
+                                  'label', 'telegram') end as source,
+            case when json_array_length(p.media_paths) = 1
+                 then json_object('href', '/-/media/photo/' || p.id, 'label', 'image')
+                 end as photo
+          from analyses a
+          join posts p on p.id = a.post_id
+          where a.category is not 'Skipped'
+            and (:channel = '' or p.channel_name = :channel)
+            and (:since = '' or p.timestamp >= :since)
+            and (:threat = '' or a.threat_level = :threat)
+          order by p.timestamp desc
+          limit 500
+
+      image_review:
+        title: Image review — thumbnail beside the model's own description
+        description: >-
+          The 4,194 analysed posts that have both a downloaded image and a
+          non-empty image_insights, newest first. Capped at 50 rows because the
+          images are served at full size (~143 KB each).
+        sql: |-
+          select
+            json_object('img_src', '/-/media/photo/' || p.id,
+                        'width', 280,
+                        'alt', coalesce(a.title, '')) as image,
+            p.channel_name,
+            p.timestamp,
+            a.title,
+            a.threat_level,
+            a.image_insights,
+            a.summary,
+            case when tme_link(p.channel_name, p.message_id) is null then null
+                 else json_object('href', tme_link(p.channel_name, p.message_id),
+                                  'label', 'open in Telegram') end as source
+          from analyses a
+          join posts p on p.id = a.post_id
+          where json_array_length(p.media_paths) = 1
+            and a.image_insights is not null
+            and trim(a.image_insights) <> ''
+            and a.category is not 'Skipped'
+            and (:channel = '' or p.channel_name = :channel)
+          order by p.timestamp desc
+          limit 50
+
+      threat_by_channel:
+        title: Threat level by channel
+        sql: |-
+          select
+            p.channel_name,
+            count(*) as analysed,
+            sum(a.threat_level = 'CRITICAL') as critical,
+            sum(a.threat_level = 'HIGH') as high,
+            sum(a.threat_level = 'MODERATE') as moderate,
+            sum(a.threat_level = 'LOW') as low,
+            round(avg(a.importance_score), 2) as mean_importance,
+            round(avg(a.credibility_score), 2) as mean_credibility
+          from analyses a
+          join posts p on p.id = a.post_id
+          where a.category is not 'Skipped'
+          group by p.channel_name
+          order by critical desc, analysed desc
+
+      category_counts:
+        title: Category mix (includes Skipped)
+        description: >-
+          Skipped is retained here deliberately — the volume the content gate
+          rejects is worth seeing.
+        sql: |-
+          select
+            coalesce(nullif(a.category, ''), '(null)') as category,
+            count(*) as n,
+            round(100.0 * count(*) / (select count(*) from analyses), 1) as pct,
+            round(avg(a.importance_score), 2) as mean_importance,
+            round(avg(a.urgency_score), 2) as mean_urgency
+          from analyses a
+          group by 1
+          order by n desc
+
+      score_distribution:
+        title: Score distribution (all four axes)
+        sql: |-
+          select 'importance' as axis, importance_score as score, count(*) as n
+            from analyses where category is not 'Skipped' group by 2
+          union all
+          select 'urgency', urgency_score, count(*)
+            from analyses where category is not 'Skipped' group by 2
+          union all
+          select 'credibility', credibility_score, count(*)
+            from analyses where category is not 'Skipped' group by 2
+          union all
+          select 'relevance', relevance_score, count(*)
+            from analyses where category is not 'Skipped' group by 2
+          order by axis, score
+
+      model_comparison:
+        title: Output richness by model
+        description: >-
+          Mirrors the richness metrics in scripts/bench_analysis.py — summary
+          length, entity count and image-insight rate — but over everything the
+          model has actually produced in production.
+        sql: |-
+          select
+            a.model_used,
+            count(*) as n,
+            round(avg(length(a.summary)), 1) as mean_summary_chars,
+            round(avg(json_array_length(a.key_entities)), 2) as mean_entities,
+            round(100.0 * avg(a.image_insights is not null
+                              and trim(a.image_insights) <> ''), 1) as pct_with_image_insight,
+            round(avg(a.importance_score), 2) as mean_importance,
+            round(100.0 * avg(a.threat_level in ('CRITICAL', 'HIGH')), 1) as pct_high_threat,
+            min(a.processed_at) as first_seen,
+            max(a.processed_at) as last_seen
+          from analyses a
+          where a.category is not 'Skipped'
+            and json_valid(a.key_entities)
+          group by a.model_used
+          order by n desc
+
+      unanalysed_backlog:
+        title: Unanalysed backlog by day and channel
+        description: >-
+          Posts with no analyses row. process_unanalysed() without --since is
+          meant to sweep these up, so a large backlog here is worth explaining.
+        sql: |-
+          select
+            substr(p.timestamp, 1, 10) as day,
+            p.channel_name,
+            count(*) as unanalysed
+          from posts p
+          where not exists (select 1 from analyses a where a.post_id = p.id)
+          group by day, p.channel_name
+          order by day desc, unanalysed desc
+
+      recent_leads:
+        title: Recent CRITICAL / HIGH items
+        description: Defaults to the last 7 days if days is left blank.
+        sql: |-
+          select
+            p.timestamp,
+            p.channel_name,
+            a.threat_level,
+            a.category,
+            a.title,
+            a.summary,
+            a.key_entities,
+            p.message_id
+          from analyses a
+          join posts p on p.id = a.post_id
+          where a.threat_level in ('CRITICAL', 'HIGH')
+            and p.timestamp >= date('now', '-' || coalesce(nullif(:days, ''), '7') || ' days')
+          order by
+            case a.threat_level when 'CRITICAL' then 0 else 1 end,
+            p.timestamp desc
+
+      intel_history:
+        title: Stored intelligence assessments
+        description: One synthesised front-page JSON per day, newest first.
+        sql: |-
+          select date, created_at, intel_json
+          from intel_assessments
+          order by date desc

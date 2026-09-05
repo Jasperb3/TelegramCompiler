@@ -50,9 +50,23 @@ python --version   # must be 3.11 or newer
 
 Download from [https://lmstudio.ai](https://lmstudio.ai) and install it. You need a Vision-Language Model (VLM) loaded — one that can analyse images alongside text.
 
-Recommended model (small and capable):
-- `google/gemma-4-12b-qat` — default model, excellent intelligence and vision capabilities
-- Alternatively you can try a larger GGUF model with vision support
+The pipeline can use **one model for everything, or a different model per stage**
+(see `analysis_model` / `synthesis_model` below). The two stages want different
+things:
+
+- **Analysis** scores every scraped post — a thousand or more a day. It wants a
+  small, fast, *non-reasoning* VLM. A reasoning model spends most of its output
+  budget deliberating (measured: 3,515 reasoning tokens per post against ~250
+  tokens of actual JSON), which makes a day's analysis take many hours.
+- **Synthesis** writes the intelligence front page once a day from the already
+  triaged posts. Reasoning genuinely helps here and costs one call.
+
+Recommended pairing:
+- Analysis: `mistralai/ministral-3-3b` (3B + 0.4B vision encoder, ~1-3 s/post)
+- Synthesis: any larger reasoning model you like
+
+A single capable VLM such as `google/gemma-4-12b-qat` also works for both — just
+leave `analysis_model` and `synthesis_model` unset.
 
 To start the server inside LM Studio: **Local Server → Start Server** (default port 1234).
 
@@ -82,7 +96,9 @@ python -m tg_compiler.main --help
 
 Expected output:
 ```
-usage: tg_compiler [-h] [--config CONFIG] [--batch] [--daemon] [--generate] [--analyse] [--since TIME] [--layout {desktop,mobile}]
+usage: tg_compiler [-h] [--config CONFIG] [--batch] [--daemon] [--generate]
+                   [--analyse] [--since TIME] [--analysis-profile NAME]
+                   [--layout {desktop,mobile}]
 ```
 
 ---
@@ -135,7 +151,20 @@ lmstudio:
   analysis_tokens_per_image: 250   # extra budget per attached image (max 3 per post)
   analysis_max_tokens: 4000        # hard ceiling on any single analysis call
   synthesis_max_tokens: 24000      # token budget for the intel front-page synthesis (keep generous: reasoning models deliberate before emitting JSON)
-  max_concurrent_analyses: 1       # parallel LLM calls; increase if your GPU can handle it
+  max_concurrent_analyses: 4       # parallel LLM calls; see "Throughput" below
+
+  # --- Per-stage models (optional; both fall back to `model`) ---
+  analysis_model: "mistralai/ministral-3-3b"   # fast non-reasoning VLM for scoring every post
+  synthesis_model: "prism-ml/bonsai-27b"       # reasoning model for the daily front page
+  manage_models: true              # load/unload each stage's model via the LM Studio SDK
+  unload_others: true              # free VRAM before loading the next stage's model
+  model_ttl_seconds: 3600          # LM Studio unloads an idle model after this
+  # model_context_length: 32768    # optional load-time context override
+
+  # --- Batched analysis (optional; 1 = one post per call, the default) ---
+  batch_size: 1                    # text-only posts per LLM call
+  batch_size_with_images: 1        # media-bearing posts per LLM call
+  # Only worth raising for a *reasoning* analysis model — see "Throughput" below.
 
 triage:
   keywords: ["urgent", "breaking", "launch"]  # words that add keyword_boost to a post's score
@@ -176,7 +205,16 @@ storage:
   db_path: "./data/briefing.db"
   media_dir: "./data/media"
   retention_days: 30          # delete media older than this many days
+  # analysis_lookback_days: 30  # how far back --batch reaches for unanalysed posts, and
+                                # the cap on lookback_seconds. Defaults to retention_days
 ```
+
+`analysis_lookback_days` is the **analysis window**. Past `retention_days` the media a
+post references has already been purged, so analysing it means analysing it blind on its
+text — by default `--batch` therefore reaches back exactly as far as media is kept. Older
+unanalysed posts stay queued and are reachable with an explicit `--since`, which overrides
+the window in both directions. Setting the field higher than `retention_days` is allowed
+but only buys text-only analyses of old posts.
 
 ### Step 3 — Set up your `.env` file
 
@@ -297,6 +335,19 @@ Accepted formats: `HH:MM` (today at that UTC time), `YYYY-MM-DD` (midnight on th
 
 Daemon mode runs indefinitely, listening for new messages in real time and generating a PDF automatically at the configured `generate_at` time each day.
 
+**How posts get analysed.** The daemon stores each post the moment it arrives,
+then analyses newly stored posts in a sweep every 10 minutes
+(`DAEMON_ANALYSIS_INTERVAL_SECS` in `main.py`) rather than one at a time on
+arrival. Analysis is therefore *eventually* consistent — a post is analysed
+within a sweep interval, not instantly — which is invisible to a once-nightly
+briefing and is what lets the daemon use a slower, better model (see
+[Run modes and analysis profiles](#run-modes-and-analysis-profiles)). Posts that
+arrive mid-sweep are picked up by the next one; the queue lives in the database,
+so nothing is lost if the daemon restarts.
+
+The sweep only considers posts stored **since the daemon started**. It will not
+work through a historical backlog — that remains `--batch`'s job.
+
 > **Important:** The daemon is a live listener only. It processes messages that arrive while it is running — it does **not** backfill historical posts. Always run `--batch` first to catch up on any posts you want in the briefing, then start the daemon.
 
 > **Warning:** Do not run `--batch` (or `--generate`/`--analyse`) while the daemon is running. Both share one Telegram session file and one SQLite database — running them concurrently can lock the session or the database. Stop the daemon first (`Ctrl+C` or `kill`), run the catch-up command, then restart the daemon.
@@ -328,8 +379,8 @@ What happens at startup:
 
 What happens when a new message arrives:
 1. Downloads attached media (if any)
-2. Inserts a `PostRecord` into SQLite
-3. Sends the post to LM Studio for analysis (including threat level) and saves the result
+2. Inserts a `PostRecord` into SQLite — analysis happens later, in the periodic sweep described above, not inline
+3. Advances the channel's cursor, so a later `--batch` resumes from here
 4. Duplicate posts (by channel_id + message_id) are silently skipped
 
 What happens at `generate_at` time each day:
@@ -391,6 +442,141 @@ The default can also be set permanently via `generation.pdf_layout` in `config.y
 ### Sharing the PDF — `share_to_directory`
 
 Set `generation.share_to_directory` in `config.yaml` to a directory path, and the final generated PDF (after the intelligence front page has been prepended) is copied there too — e.g. a Syncthing/Dropbox/Nextcloud folder for reading on another device. Leave it unset (the default) to disable this.
+
+---
+
+## Run modes and analysis profiles
+
+The two ways of analysing posts have opposite constraints:
+
+- **`--batch` / `--since`** processes a whole day at once. A thousand-plus posts
+  have to be analysed in one sitting, so speed decides whether the run finishes.
+- **`--daemon`** watches channels live. Posts trickle in, there is idle time
+  between them, and a slower but better model can be afforded.
+
+An **analysis profile** is a named set of LM Studio settings for one mode.
+`--batch`/`--since` select the `batch` profile, `--daemon` selects `daemon`, and
+`--analysis-profile NAME` overrides either:
+
+```bash
+python -m tg_compiler.main --batch                          # uses the "batch" profile
+python -m tg_compiler.main --daemon                         # uses the "daemon" profile
+python -m tg_compiler.main --daemon --analysis-profile batch  # daemon, but with the fast model
+```
+
+A profile carries **the model and the settings that must accompany it** — token
+budgets, concurrency, context length, batch sizes — because those are
+model-specific. A reasoning model needs a large `analysis_base_tokens` or its
+JSON is truncated mid-deliberation; a small model needs a fraction of that, and
+several large-budget image requests at once will exhaust LM Studio's context.
+Carrying only a model name between modes reliably breaks one of them.
+
+```yaml
+lmstudio:
+  analysis_profiles:
+    batch:
+      model: "mistralai/ministral-3-3b"
+      analysis_base_tokens: 700
+      analysis_max_tokens: 1600
+      max_concurrent_analyses: 4
+      model_context_length: 32768
+    daemon:
+      model: "prism-ml/bonsai-27b"
+      analysis_base_tokens: 9500
+      analysis_max_tokens: 16000
+      max_concurrent_analyses: 1
+      model_context_length: 32768
+      batch_size: 10
+      batch_size_with_images: 3
+```
+
+Omit `analysis_profiles` entirely and both modes use the plain `lmstudio`
+settings, exactly as before. A profile only states what differs; everything else
+is inherited. Naming a profile that doesn't exist with `--analysis-profile` is an
+error; a *mode default* that doesn't exist simply falls back to the plain
+settings.
+
+**Pick a daemon model equal to `synthesis_model` where you can.** If they differ
+and `manage_models` is on, every analysis sweep and every nightly generation
+swaps weights (~16 s per load), which at a 10-minute cadence is pure waste.
+
+---
+
+## Throughput — choosing an analysis model, batch size and concurrency
+
+Analysis dominates runtime: it touches every scraped post (1,000–1,700 a day on a
+16-channel setup), while everything downstream runs once. The settings below were
+chosen from measurements on an RTX 3080 Ti Laptop (16 GB), and the numbers are
+recorded here so they can be re-checked rather than guessed at.
+
+**Reasoning tokens are the thing that matters.** On a reasoning model, 93–97% of
+every generated token is deliberation the briefing never sees:
+
+| model | s/post (one post per call) | reasoning tokens/post |
+|---|---|---|
+| `prism-ml/bonsai-27b` (reasoning) | 85.8 | 3,878 |
+| `mistralai/ministral-3-3b` | 2.2–3.0 | **0** |
+| `google/gemma-3-4b` | 2.9 | 0 |
+
+LM Studio exposes no way to cap reasoning separately — `reasoning_effort`,
+`chat_template_kwargs.enable_thinking` and `reasoning: {effort}` were all accepted
+and ignored — so the only remedy is a model that does not deliberate.
+
+**Batching helps reasoning models, and only them.** Several posts in one call
+amortise the per-call deliberation. On `bonsai-27b` a batch of 10 cut reasoning
+from 3,515 to 693 tokens per post (191 → 39.6 s/post). On a non-reasoning model
+there is nothing to amortise, and batching costs output quality:
+
+| batch (ministral) | s/post | mean summary chars | mean entities |
+|---|---|---|---|
+| **1** | 3.0 | **281** | **3.6** |
+| 5 | 2.0 | 180 | 2.8 |
+| 10 | 1.8 | 179 | 2.3 |
+
+Batch 10 buys 1.7x on text (1.07x on images) for 36% shorter summaries, 36% fewer
+entities, and only ~50% category agreement with the model's own single-post
+output. **So: keep `batch_size: 1` for a fast model; raise it only if you point
+analysis at a reasoning model.** Everything the batch path adds — index mapping,
+the anchor check, salvage, the fallback ladder — is inert at size 1.
+
+**Concurrency is the better lever for a small model**, but its ceiling is set by
+total concurrent context, not by the request count:
+
+| configuration | s/post | outcome |
+|---|---|---|
+| batch 1, `max_concurrent_analyses: 1` | 2.17 | all OK |
+| batch 1, `max_concurrent_analyses: 4` | **1.10** | all OK |
+| batch 10, `max_concurrent_analyses: 4` | — | **every request failed** |
+
+Large concurrent requests exhaust context and fail outright. Keep
+`analysis_*` token budgets sized for the model actually doing the analysis: a
+budget tuned for a reasoning model (`analysis_max_tokens: 16000`) reserves far
+more than a small model needs, and four such image-post requests at once will
+fail. A non-reasoning model needs roughly 250 output tokens per post.
+
+Realistic end-to-end figure for a full day of 1,239 real posts with
+`batch_size: 1` and `max_concurrent_analyses: 4`: **2.6 s/post, ~52 minutes**.
+Microbenchmarks on short text-only posts report ~1.1 s/post; a real day includes
+image posts and long posts, so expect the higher figure.
+
+**A large model cannot keep up post-by-post.** This is why the daemon batches
+rather than analysing each post on arrival:
+
+| | 1,100 posts/day | 1,700 posts/day |
+|---|---|---|
+| bonsai-27b, one post per call (85.8 s/post) | 26 h/day | 40 h/day |
+| bonsai-27b, **batched ×10** (23.1 s/post) | **7 h/day** | 11 h/day |
+
+Channels here produce 750–1,700 posts a day. One at a time, a reasoning model
+needs more hours per day than a day contains and falls permanently behind;
+batched, it fits. So a `daemon` profile using a reasoning model should set
+`batch_size: 10` — the one case where batching earns its cost.
+
+**Model swapping.** With `manage_models: true` the analyzer and synthesiser each
+load their own model at stage entry via the LM Studio Python SDK, unloading the
+other first. This is required when the two models cannot co-reside in VRAM — a
+27B model occupies ~12 GB of a 16 GB card. With `manage_models: false` (the
+default) nothing is loaded or unloaded and whatever is already running is used.
 
 ---
 
@@ -511,6 +697,119 @@ pytest tests/test_triage.py::test_composite_score_formula -v   # single test
 ```
 
 Tests use in-memory SQLite and do not require Telegram credentials or a running LM Studio server.
+
+---
+
+## Inspecting the database
+
+The pipeline's own output — the PDF — is already triaged and filtered. To look at what the
+analysis stage actually produced, browse `data/briefing.db` directly with
+[Datasette](https://datasette.io/), an optional dev dependency:
+
+```bash
+source .venv/bin/activate
+pip install -e ".[inspect]"                                    # one-off, ~15 pure-Python packages
+
+datasette data/briefing.db \
+  -m scripts/datasette_metadata.yaml \
+  --plugins-dir scripts/datasette_plugins
+# then open http://localhost:8001
+```
+
+WSL2 forwards `localhost`, so a browser on the Windows side reaches it with no extra flags.
+
+**This cannot corrupt or modify the database.** Datasette opens the file through a
+`file:...?mode=ro` SQLite URI and additionally rejects any statement that is not a `SELECT`,
+so it is safe to browse while `--batch` or `--daemon` is writing — WAL readers and the
+writer do not block each other, and you see committed data live.
+
+> **Never pass `-i` / `--immutable` against `data/briefing.db`.** That flag asserts to SQLite
+> that the file will never change, which is false during a run, and yields incorrect reads
+> rather than a clean error. It is only legitimate against a snapshot (see below).
+
+`scripts/datasette_metadata.yaml` sets up faceted browsing (channel on `posts`; category,
+threat level and model on `analyses`) plus these canned queries, linked from the database page:
+
+| Query | What it answers |
+|---|---|
+| `analysed_posts` | The denormalised analysis-with-source-post join. Filter by channel, date and threat level; blank fields are ignored. |
+| `threat_by_channel` | Threat-level mix and mean scores per channel. |
+| `category_counts` | Category distribution, including how much the content gate marks `Skipped`. |
+| `score_distribution` | Histogram across all four scoring axes. |
+| `model_comparison` | Output richness per `model_used` — summary length, entity count, image-insight rate — over production output rather than a benchmark sample. |
+| `unanalysed_backlog` | Posts with no `analyses` row, by day and channel. |
+| `recent_leads` | CRITICAL / HIGH items from the last N days (default 7). |
+| `intel_history` | The stored per-day synthesised assessments. |
+
+The configuration adds no views, tables or indexes — nothing for `init_schema()` to collide with.
+
+Four plugins ship with the `inspect` extra and load automatically:
+
+| Plugin | What it adds |
+|---|---|
+| `datasette-media` | Serves the scraped images at `/-/media/photo/<post id>`. |
+| `datasette-json-html` | Turns a JSON cell into real HTML — inline thumbnails and clickable links. |
+| `datasette-pretty-json` | Formats the four JSON columns (`key_entities`, `media_paths`, `raw_json`, `intel_json`). |
+| `datasette-vega` | Point-and-click charts on any query result, from dropdowns above the table. |
+
+The payoff is the **`image_review`** query: a thumbnail of each scraped image beside the
+model's own `image_insights` for it, so image-analysis quality can be judged at a glance.
+4,194 analysed posts qualify; the query shows the 50 most recent, because images are served
+at full size (~143 KB each) rather than resized.
+
+Two things worth knowing:
+
+- **Run Datasette from the project root.** `media_paths` stores paths relative to it
+  (`data/media/...`), and `datasette-media` opens them as given.
+- **`posts.channel_name` is the slug, not the Telegram username** — they differ for 7 of the
+  16 channels (`WarFrontWitness` → `wfwitness`, `RerumNovarum` → `rnintel`, …). Building a
+  `t.me/<channel_name>/...` link in SQL therefore produces dead links. Use the
+  `tme_link(slug, message_id)` SQL function instead: `scripts/datasette_plugins/channel_links.py`
+  registers it, backed by `AppConfig.channel_link_map()` so it cannot drift from `config.yaml`.
+  It returns `NULL` for a channel with no configured username, and the viewer still starts if
+  `config.yaml` is missing.
+
+`datasette-vega` is unmaintained (last release 2018) but bundles vega-lite offline and only
+injects static assets, so it works fine here. If a future Datasette upgrade ever breaks it,
+drop it from the `inspect` extra — nothing else depends on it.
+
+### Stopping it — the "Stop server" button
+
+`scripts/datasette_plugins/shutdown_button.py` adds a red **Stop server** button to the
+bottom-right of every page. It asks for confirmation, then shuts Datasette down gracefully:
+uvicorn finishes in-flight requests, closes connections, and the `datasette` command exits 0,
+returning your terminal to a prompt. `Ctrl-C` in the terminal does the same thing.
+
+The database is never at risk — Datasette holds only `mode=ro` connections, so there is
+nothing to flush or roll back. `pragma integrity_check` returns `ok` afterwards.
+
+The endpoint that does this (`POST /-/shutdown`) stops a process, so it is guarded three ways:
+POST only, CSRF-checked by Datasette's own middleware, and refused unless the request's `Host`
+is loopback — so the button is inert if you ever bind to a public interface with `-h 0.0.0.0`.
+
+**On closing the browser tab:** the button tries, but browsers only permit a page to close
+itself when a script opened that window in the first place. A tab you opened by typing the URL
+will not close — Chrome and Firefox both block it. So instead of silently failing, the page
+replaces itself with a "Datasette has stopped" panel telling you the tab is now safe to close
+with `Ctrl+W`. If you want genuine one-click closing, launch the UI from a script-opened
+window; there is no way to get it from a normally-opened tab.
+
+For heavy exploratory queries, work from a snapshot instead of the live file. `.backup` is an
+online, WAL-safe copy, and `--immutable` is safe (and faster) on the copy:
+
+```bash
+sqlite3 data/briefing.db ".backup /tmp/briefing-snap.db"
+datasette -i /tmp/briefing-snap.db -m scripts/datasette_metadata.yaml
+```
+
+A cold first run of `unanalysed_backlog` scans all posts and can brush against Datasette's
+default 1-second query limit; add `--setting sql_time_limit_ms 8000` if you hit it.
+
+For a quick one-off without the UI, the same read-only guarantee applies to the CLI:
+
+```bash
+sqlite3 -box "file:data/briefing.db?mode=ro" "select count(*) from analyses;"
+```
 
 ---
 
