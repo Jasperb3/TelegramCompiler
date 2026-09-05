@@ -481,32 +481,52 @@ def salvage_batch_items(raw: str) -> BatchAnalysis:
     return BatchAnalysis(analyses=items)
 
 
-_NUM_RE = re.compile(r'\b(\d+(?:\.\d+)?)\b')
+# No leading \b: "M8.4" is a magnitude, and \b would skip the 8 and read the 4.
+# The lookbehind still stops a match restarting inside a number.
+_NUM_RE = re.compile(r'(?<![\d.,])(\d+(?:\.\d+)?)\b')
 _TIME_TOKEN_RE = re.compile(r'\b\d{1,2}:\d{2}\b')  # e.g. "14:30"
 _YEAR_TOKEN_RE = re.compile(r'\b(?:19|20)\d{2}\b')  # e.g. "2026"
 _THOUSANDS_RE = re.compile(r'\b\d{1,3}(?:,\d{3})+\b')  # e.g. "1,200"
+_NUMERIC_PAIR_RE = re.compile(r'\b\d+-\d+\b')  # e.g. "Boeing 737-524"
+# Ordered alternation: a letter-prefixed decimal is a real quantity ("M8.4"
+# magnitude) and is kept; any other token mixing letters and digits is a
+# designator, serial or ordinal ("T-72", "Tu-22M3", "Flightradar24", "EP1048",
+# "A0821/26", "3rd") and is blanked.
 _DESIGNATOR_RE = re.compile(
-    r'\b[A-Za-z]{1,4}-\d+(?:[-/]\d+)*\b'      # T-72, Su-34, Kh-101, S-300, MiG-29
-    r'|\b\d+-\d+\b'                            # Boeing 737-524
-    r'|\b[A-Za-z]{1,4}\d{3,}(?:/\d+)*\b'       # EP1048, CP972, NOTAM A0821/26
-    r'|\b\d+(?:st|nd|rd|th)\b'                  # 3rd Assault Brigade
+    r'(?P<keep>\b[A-Za-z]{1,2}\d+\.\d+\b)'
+    r'|(?P<token>\b[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*\b)'
 )
 _NUM_CONTEXT_CHARS = 30
+
+
+_NOUN_WINDOW_WORDS = 3
+_WORD_RE = re.compile(r"[A-Za-z]+")
+_NOUN_STOPWORDS = frozenset("""
+a an the of in on at and or to was were is are be been by for from with that this
+its it as has have had but not more than about over near into out up down per said
+say says reported reportedly approximately around least some other new also which
+who when where while their his her there here between during after before
+""".split())
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
 
 class _Num(NamedTuple):
     """A number found in a text, with the surrounding words that give it meaning."""
     value: float
     context: str
+    start: int
+    nouns: frozenset[str]
 
 
 def _strip_non_quantity_numbers(text: str) -> str:
     """Normalise `text` so only genuine quantities survive as numbers.
 
     Times ("14:30"), years ("2026"), equipment and unit designators ("T-72",
-    "Boeing 737-524", "EP1048", NOTAM serial "A0821/26") and ordinals ("3rd")
-    are not quantities, but each collides with casualty and count figures of
-    similar magnitude — this corpus is saturated with them. Thousands
+    "Tu-22M3", "Boeing 737-524"), brand and serial tokens ("Flightradar24",
+    "EP1048", NOTAM serial "A0821/26") and ordinals ("3rd") are not quantities,
+    but each collides with casualty and count figures of similar magnitude —
+    this corpus is saturated with them. A letter-prefixed decimal is the one
+    mixed token that IS a quantity ("M8.4" magnitude), so it survives. Thousands
     separators are joined up first, so "1,200 troops" yields 1200 rather than a
     phantom 1 alongside a 200.
 
@@ -516,15 +536,33 @@ def _strip_non_quantity_numbers(text: str) -> str:
         digits = m.group(0).replace(",", "")
         return digits + " " * (len(m.group(0)) - len(digits))
 
+    def blank_designator(m: re.Match) -> str:
+        token = m.group(0)
+        if m.lastgroup == "keep":
+            return token
+        mixed = any(c.isalpha() for c in token) and any(c.isdigit() for c in token)
+        return " " * len(token) if mixed else token
+
     blank = lambda m: " " * len(m.group(0))  # noqa: E731
     text = _THOUSANDS_RE.sub(join_thousands, text)
+    text = _NUMERIC_PAIR_RE.sub(blank, text)
     text = _TIME_TOKEN_RE.sub(blank, text)
     text = _YEAR_TOKEN_RE.sub(blank, text)
-    return _DESIGNATOR_RE.sub(blank, text)
+    return _DESIGNATOR_RE.sub(blank_designator, text)
+
+
+def _nouns_after(text: str, offset: int) -> frozenset[str]:
+    """The first few content words following a number — what it counts.
+
+    A window rather than the single next token, because the unit and the noun
+    are often separated ("7.8 magnitude earthquake" against "M8.4 earthquake")."""
+    words = (w.group(0).lower().rstrip("s") for w in _WORD_RE.finditer(text, offset))
+    kept = [w for w in words if w and w not in _NOUN_STOPWORDS]
+    return frozenset(kept[:_NOUN_WINDOW_WORDS])
 
 
 def _extract_numbers(text: str) -> list[_Num]:
-    """Every positive quantity in `text`, each with +/-30 chars of context."""
+    """Every positive quantity in `text`, with context and the nouns it counts."""
     stripped = _strip_non_quantity_numbers(text)
     out = []
     for m in _NUM_RE.finditer(stripped):
@@ -533,16 +571,22 @@ def _extract_numbers(text: str) -> list[_Num]:
             continue
         start = max(0, m.start() - _NUM_CONTEXT_CHARS)
         end = min(len(text), m.end() + _NUM_CONTEXT_CHARS)
-        out.append(_Num(value, text[start:end].strip()))
+        out.append(_Num(
+            value, text[start:end].strip(), m.start(), _nouns_after(stripped, m.end()),
+        ))
     return out
 
 
 def _find_numeric_conflict(summary: str, image_desc: str) -> tuple[_Num, _Num] | None:
     """Return the (image, summary) number pair that contradicts, or None.
 
-    Two numbers are 'comparable' if they are within the same order of magnitude
-    (ratio <= 10x).  They 'contradict' if they differ by more than 5% relative to
-    the smaller value.  When either text has no numbers, we assume consistent.
+    Two numbers are 'comparable' if they count the same thing — they share a
+    noun in the few words that follow each — and are within the same order of
+    magnitude (ratio <= 10x).  They 'contradict' if they differ by more than 5%
+    relative to the smaller value.  The noun test matters because the prompt has
+    the summary describe the event and the image description describe what the
+    picture adds, so most number pairs across the two texts are unrelated by
+    design and nothing but arithmetic tied them together before.
     """
     if not summary or not image_desc:
         return None
@@ -550,12 +594,31 @@ def _find_numeric_conflict(summary: str, image_desc: str) -> tuple[_Num, _Num] |
     i_nums = _extract_numbers(image_desc)
     for img_n in i_nums:
         for sum_n in s_nums:
+            if not img_n.nouns & sum_n.nouns:
+                continue  # counting different things — not comparable
             lo, hi = sorted((img_n.value, sum_n.value))
             if hi / lo > 10.0:
                 continue  # different orders of magnitude — unrelated quantities
             if (hi - lo) / lo > 0.05:
                 return img_n, sum_n
     return None
+
+
+def _drop_sentence_at(text: str, offset: int) -> str | None:
+    """Remove the sentence containing `offset`, keeping the rest of `text`.
+
+    A contradicted number condemns its own claim, not the whole description —
+    what is shown, where, and any translated on-image text are usually in other
+    sentences and were fine. Returns None when nothing substantive survives."""
+    sentences = _SENTENCE_SPLIT_RE.split(text)
+    kept, pos = [], 0
+    for sentence in sentences:
+        start = text.index(sentence, pos)
+        pos = start + len(sentence)
+        if not start <= offset < pos:
+            kept.append(sentence)
+    remaining = " ".join(kept).strip()
+    return remaining or None
 
 
 def _check_numeric_consistency(summary: str, image_desc: str) -> bool:
@@ -583,13 +646,15 @@ def _sanitize(analysis: PostAnalysis) -> PostAnalysis:
     )
     if conflict is not None:
         img_n, sum_n = conflict
-        log.info(
-            "Image description dropped for post %r: numeric mismatch with summary "
+        kept = _drop_sentence_at(analysis.image_description, img_n.start)
+        log.warning(
+            "Image description %s for post %r: numeric mismatch with summary "
             "(image %g in %r vs summary %g in %r)",
+            "sentence dropped" if kept else "dropped",
             analysis.title or analysis.summary[:60],
             img_n.value, img_n.context, sum_n.value, sum_n.context,
         )
-        analysis.image_description = None
+        analysis.image_description = kept
 
     analysis.title = escape_html(analysis.title)
     analysis.summary = escape_html(analysis.summary)

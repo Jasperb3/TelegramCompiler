@@ -149,8 +149,66 @@ def test_numeric_consistency_notam_serial_false_positive():
     assert _check_numeric_consistency(summary, image) is True
 
 
+def test_numeric_consistency_ignores_brand_and_suffix_designators():
+    # Reading "M8.4" as a quantity also exposed "Flightradar24" and the "M3" of
+    # "Tu-22M3" — mixed letter/digit tokens that are names, not counts.
+    assert _check_numeric_consistency(
+        "An Airbus A300B4-60SR aircraft operated by Iran Air made 3 approaches",
+        "A tracking map from Flightradar24 showing the path of an aircraft",
+    ) is True
+    assert _check_numeric_consistency(
+        "A Tu-22M3 crashed in Irkutsk on the evening of June 15",
+        "A video of the Russian Tu-22M3 heavy bomber nose diving into a field",
+    ) is True
+
+
 def test_numeric_consistency_ignores_ordinals():
     assert _check_numeric_consistency("Officials say 80 killed in the strike", "Insignia of the 72nd Mechanised Brigade is visible") is True
+
+
+def test_numeric_consistency_unrelated_quantities_not_compared():
+    # 8 dead and 3 vehicles are both small integers 2.7x apart, but they count
+    # different things — the summary describes the event, the image describes
+    # what the picture adds, so most number pairs across them are unrelated.
+    assert _check_numeric_consistency("Officials say 8 killed in the blast", "The image shows 3 armoured vehicles") is True
+
+
+def test_numeric_consistency_shared_noun_still_compared():
+    assert _check_numeric_consistency("Officials say 8 killed in the blast", "The caption reads 3 killed") is False
+
+
+def test_extract_numbers_reads_a_letter_prefixed_magnitude():
+    from tg_compiler.analyzer import _extract_numbers
+
+    assert [n.value for n in _extract_numbers("An M8.4 earthquake struck")] == [8.4]
+
+
+def test_extract_numbers_does_not_split_a_plain_decimal():
+    from tg_compiler.analyzer import _extract_numbers
+
+    assert [n.value for n in _extract_numbers("A 7.8 magnitude quake")] == [7.8]
+
+
+def test_sanitize_strips_only_the_contradicting_sentence():
+    analysis = _analysis(summary="Officials say 12 killed in the blast.")
+    analysis.image_description = (
+        "The image shows a damaged apartment block in central Kharkiv. "
+        "A caption reads 45 killed. "
+        "Cyrillic text on the banner reads 'emergency services'."
+    )
+
+    cleaned = _sanitize(analysis)
+
+    assert "damaged apartment block" in cleaned.image_description
+    assert "emergency services" in cleaned.image_description
+    assert "45" not in cleaned.image_description
+
+
+def test_sanitize_nulls_description_that_is_only_the_contradiction():
+    analysis = _analysis(summary="Officials say 12 killed in the blast.")
+    analysis.image_description = "A caption reads 45 killed."
+
+    assert _sanitize(analysis).image_description is None
 
 
 def test_numeric_consistency_genuine_contradiction_still_detected():
