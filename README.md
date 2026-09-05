@@ -205,7 +205,16 @@ storage:
   db_path: "./data/briefing.db"
   media_dir: "./data/media"
   retention_days: 30          # delete media older than this many days
+  # analysis_lookback_days: 30  # how far back --batch reaches for unanalysed posts, and
+                                # the cap on lookback_seconds. Defaults to retention_days
 ```
+
+`analysis_lookback_days` is the **analysis window**. Past `retention_days` the media a
+post references has already been purged, so analysing it means analysing it blind on its
+text — by default `--batch` therefore reaches back exactly as far as media is kept. Older
+unanalysed posts stay queued and are reachable with an explicit `--since`, which overrides
+the window in both directions. Setting the field higher than `retention_days` is allowed
+but only buys text-only analyses of old posts.
 
 ### Step 3 — Set up your `.env` file
 

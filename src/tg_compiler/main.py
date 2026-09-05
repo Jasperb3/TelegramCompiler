@@ -79,6 +79,12 @@ async def run_batch(config: AppConfig, since_dt: datetime | None = None) -> None
     db.init_schema()
     today = datetime.now(timezone.utc).date()
 
+    # Without --since, analysis reaches back exactly as far as media is kept: past
+    # that point purge_old_media() has deleted the images a post references, so the
+    # model would be analysing it blind on its text. Older unanalysed posts stay
+    # queued and are recoverable with an explicit --since, which wins outright.
+    cutoff = since_dt or config.storage.analysis_cutoff(datetime.now(timezone.utc))
+
     total_scraped = 0
     from tqdm import tqdm
     from tqdm.contrib.logging import logging_redirect_tqdm
@@ -92,9 +98,13 @@ async def run_batch(config: AppConfig, since_dt: datetime | None = None) -> None
                 except Exception as e:
                     log.error("Scraping channel %s failed: %s", channel_cfg.slug, e)
         channel_map = scraper.channel_map
+        # Still inside the Scraper context: repair runs on the connected client.
+        repaired = await scraper.repair_missing_media(db.get_unanalysed_posts(since=cutoff))
+        if repaired:
+            log.info("Repaired media for %d posts", repaired)
 
     analyzer = Analyzer(config, db)
-    analysed_count, skipped_count = await analyzer.process_unanalysed(channel_map, since=since_dt)
+    analysed_count, skipped_count = await analyzer.process_unanalysed(channel_map, since=cutoff)
     log.info("Analysed %d posts (skipped %d)", analysed_count, skipped_count)
 
     path, content = await generate_daily_briefing(
@@ -386,6 +396,18 @@ def main() -> None:
 
     if args.layout:
         cfg.generation.pdf_layout = args.layout
+
+    # The scrape lookback (used on first run / after a cursor reset) is capped at
+    # the same window, so a reset can't pull in months of history whose media will
+    # never exist. An explicit --since below deliberately overrides this.
+    window_secs = cfg.storage.analysis_lookback_days_effective() * 86400
+    if cfg.telegram.lookback_seconds > window_secs:
+        log.info(
+            "Capping lookback_seconds %d -> %d (analysis window is %d days)",
+            cfg.telegram.lookback_seconds, window_secs,
+            cfg.storage.analysis_lookback_days_effective(),
+        )
+        cfg.telegram.lookback_seconds = window_secs
 
     since_dt = None
     if args.since:

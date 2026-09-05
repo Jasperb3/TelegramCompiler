@@ -254,3 +254,39 @@ def test_config_without_profiles_is_unchanged():
     cfg = LMStudioConfig(model="m")
     assert cfg.analysis_profiles == {}
     assert cfg.with_analysis_profile("batch") is cfg
+
+
+def test_analysis_lookback_days_defaults_to_retention_days():
+    from tg_compiler.config import StorageConfig
+
+    assert StorageConfig(retention_days=14).analysis_lookback_days_effective() == 14
+
+
+def test_analysis_lookback_days_overrides_retention_days():
+    from tg_compiler.config import StorageConfig
+
+    cfg = StorageConfig(retention_days=30, analysis_lookback_days=7)
+    assert cfg.analysis_lookback_days_effective() == 7
+
+
+def test_analysis_cutoff_is_now_minus_the_window():
+    from datetime import datetime, timedelta, timezone
+
+    from tg_compiler.config import StorageConfig
+
+    now = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    assert StorageConfig(retention_days=30).analysis_cutoff(now) == now - timedelta(days=30)
+
+
+def test_zero_analysis_lookback_days_rejected():
+    from tg_compiler.config import StorageConfig
+
+    with pytest.raises(ValidationError):
+        StorageConfig(analysis_lookback_days=0)
+
+
+def test_unknown_storage_key_rejected(tmp_path):
+    f = tmp_path / "config.yaml"
+    f.write_text(MINIMAL_YAML + '\nstorage:\n  analysis_lookback: 7\n')
+    with pytest.raises(ValidationError):
+        load_config(str(f))

@@ -159,6 +159,9 @@ async def test_run_batch_continues_after_one_channel_fails(tmp_path, batch_confi
             scraped_channels.append(channel_cfg.slug)
             return []
 
+        async def repair_missing_media(self, posts):
+            return 0
+
     class FakeAnalyzer:
         def __init__(self, config, db):
             pass
@@ -200,6 +203,9 @@ async def test_run_batch_passes_since_dt_to_process_unanalysed(tmp_path, batch_c
 
         async def scrape_channel(self, channel_cfg):
             return []
+
+        async def repair_missing_media(self, posts):
+            return 0
 
     received_since = []
 
@@ -245,6 +251,9 @@ async def test_run_batch_purges_old_media(tmp_path, batch_config, monkeypatch):
 
         async def scrape_channel(self, channel_cfg):
             return []
+
+        async def repair_missing_media(self, posts):
+            return 0
 
     class FakeAnalyzer:
         def __init__(self, config, db):
@@ -1180,3 +1189,133 @@ def test_cli_without_profiles_configured_is_unchanged(tmp_path, monkeypatch):
 
     assert seen["config"] is cfg
     assert seen["config"].lmstudio.model_for("analysis") == "only-model"
+
+
+# --- analysis window ----------------------------------------------------------
+
+def _window_fakes(monkeypatch, received_since, repaired):
+    class FakeScraper:
+        def __init__(self, config, db):
+            self.channel_map = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def scrape_channel(self, channel_cfg):
+            return []
+
+        async def repair_missing_media(self, posts):
+            repaired.append(posts)
+            return 0
+
+    class FakeAnalyzer:
+        def __init__(self, config, db):
+            pass
+
+        async def process_unanalysed(self, channel_map=None, since=None):
+            received_since.append(since)
+            return 0, 0
+
+    async def fake_generate_daily_briefing(config, today, db, **kwargs):
+        from tg_compiler.triage import BriefingContent
+        return "fake.pdf", BriefingContent(date=today, main_items=[], appendix_items=[])
+
+    async def fake_run_analysis(config, today, main_items=None):
+        return None
+
+    monkeypatch.setattr(main_module, "Scraper", FakeScraper)
+    monkeypatch.setattr("tg_compiler.analyzer.Analyzer", FakeAnalyzer)
+    monkeypatch.setattr(main_module, "generate_daily_briefing", fake_generate_daily_briefing)
+    monkeypatch.setattr("tg_compiler.synthesiser.run_analysis", fake_run_analysis)
+
+
+async def test_run_batch_without_since_scopes_analysis_to_the_window(
+    tmp_path, batch_config, monkeypatch
+):
+    from datetime import datetime, timedelta, timezone
+
+    batch_config.storage.db_path = str(tmp_path / "db.sqlite")
+    batch_config.storage.retention_days = 30
+    received_since, repaired = [], []
+    _window_fakes(monkeypatch, received_since, repaired)
+
+    before = datetime.now(timezone.utc)
+    await main_module.run_batch(batch_config)
+    after = datetime.now(timezone.utc)
+
+    assert len(received_since) == 1
+    cutoff = received_since[0]
+    assert before - timedelta(days=30) <= cutoff <= after - timedelta(days=30)
+
+
+async def test_run_batch_since_overrides_the_window(tmp_path, batch_config, monkeypatch):
+    from datetime import datetime, timezone
+
+    batch_config.storage.db_path = str(tmp_path / "db.sqlite")
+    received_since, repaired = [], []
+    _window_fakes(monkeypatch, received_since, repaired)
+
+    since_dt = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    await main_module.run_batch(batch_config, since_dt)
+
+    assert received_since == [since_dt]
+
+
+async def test_run_batch_repairs_missing_media_before_analysing(
+    tmp_path, batch_config, monkeypatch
+):
+    batch_config.storage.db_path = str(tmp_path / "db.sqlite")
+    received_since, repaired = [], []
+    _window_fakes(monkeypatch, received_since, repaired)
+
+    await main_module.run_batch(batch_config)
+
+    assert repaired == [[]]  # called once, with the (empty) in-window queue
+
+
+def _run_cli_with_config(monkeypatch, cfg, argv):
+    """main() with the run functions stubbed, returning the config run_batch saw."""
+    import sys
+
+    seen = {}
+    monkeypatch.setattr(main_module, "load_config", lambda *a, **kw: cfg)
+    monkeypatch.setattr(main_module.asyncio, "run", lambda coro: coro.close())
+    monkeypatch.setattr(main_module, "run_batch",
+                        lambda config, since=None: seen.update(config=config) or _noop())
+    monkeypatch.setattr(sys, "argv", ["tg_compiler", *argv])
+    main_module.main()
+    return seen["config"]
+
+
+def _window_cli_config(tmp_path, lookback_seconds, retention_days):
+    return AppConfig(
+        telegram=TelegramConfig(
+            api_id=1, api_hash="x", session_name=str(tmp_path / "session"),
+            channels=[ChannelConfig(slug="chan_a", username="@chan_a")],
+            lookback_seconds=lookback_seconds,
+        ),
+        lmstudio=LMStudioConfig(model="m"),
+        storage=StorageConfig(db_path=str(tmp_path / "db.sqlite"),
+                              media_dir=str(tmp_path / "media"),
+                              retention_days=retention_days),
+    )
+
+
+def test_cli_caps_lookback_seconds_at_the_analysis_window(tmp_path, monkeypatch):
+    cfg = _window_cli_config(tmp_path, lookback_seconds=99999999, retention_days=30)
+    assert _run_cli_with_config(monkeypatch, cfg, ["--batch"]).telegram.lookback_seconds == 30 * 86400
+
+
+def test_cli_since_still_overrides_the_lookback_cap(tmp_path, monkeypatch):
+    cfg = _window_cli_config(tmp_path, lookback_seconds=600, retention_days=1)
+    resolved = _run_cli_with_config(monkeypatch, cfg, ["--batch", "--since", "2026-06-01"])
+    # --since is explicit intent and deliberately reaches past the window.
+    assert resolved.telegram.lookback_seconds > 30 * 86400
+
+
+def test_cli_leaves_a_short_lookback_alone(tmp_path, monkeypatch):
+    cfg = _window_cli_config(tmp_path, lookback_seconds=600, retention_days=30)
+    assert _run_cli_with_config(monkeypatch, cfg, ["--batch"]).telegram.lookback_seconds == 600

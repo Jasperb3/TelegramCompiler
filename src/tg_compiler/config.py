@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import zoneinfo
+from datetime import datetime, timedelta
 from typing import Literal
 
 import yaml
@@ -231,6 +232,20 @@ class StorageConfig(BaseModel):
     db_path: str = "./data/briefing.db"
     media_dir: str = "./data/media"
     retention_days: int = 30
+    # How far back --batch reaches for unanalysed posts, and the cap on the
+    # first-run/after-reset scrape lookback. Defaults to retention_days: past that
+    # point purge_old_media() has already deleted the media a post references, so
+    # analysing it means analysing it blind on its text alone.
+    analysis_lookback_days: int | None = Field(default=None, gt=0)
+
+    def analysis_lookback_days_effective(self) -> int:
+        """The analysis window in days — analysis_lookback_days, or retention_days
+        when it is unset. The fallback lives here so main.py and the scrape-lookback
+        cap can't drift apart."""
+        return self.analysis_lookback_days if self.analysis_lookback_days is not None else self.retention_days
+
+    def analysis_cutoff(self, now: datetime) -> datetime:
+        return now - timedelta(days=self.analysis_lookback_days_effective())
 
 
 class AppConfig(BaseModel):
