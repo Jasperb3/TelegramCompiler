@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from tg_compiler.analyzer import MIN_CONTENT_CHARS, Analyzer, _has_usable_media  # noqa: E402
-from tg_compiler.config import load_config  # noqa: E402
+from tg_compiler.config import ChannelConfig, load_config  # noqa: E402
 from tg_compiler.db import Database, PostRecord  # noqa: E402
 
 MEDIA_ROOT = Path("data/media")
@@ -68,10 +68,21 @@ def report(posts: list[PostRecord]) -> None:
         print(f"  {key}  {len(group):>7}  {labels[key]}{span}")
 
 
-async def drain(cfg, db: Database, since: datetime, limit: int) -> None:
-    channel_map = {c.channel_id: c for c in cfg.channels if c.channel_id}
+def channel_map(cfg, posts: list[PostRecord]) -> dict[int, ChannelConfig]:
+    """Map stored channel ids to their config, without a Telegram connection.
+
+    run_batch/run_daemon build this by resolving Telethon entities; the posts
+    already carry the pairing, since channel_name is the slug and channel_id the
+    marked peer id. The map only feeds custom_prompt lookup, so a channel absent
+    from config falls back to the default system prompt, exactly as it would
+    there."""
+    by_slug = {c.slug: c for c in cfg.telegram.channels}
+    return {p.channel_id: by_slug[p.channel_name] for p in posts if p.channel_name in by_slug}
+
+
+async def drain(cfg, db: Database, since: datetime, limit: int, posts: list[PostRecord]) -> None:
     analysed, skipped = await Analyzer(cfg, db).process_unanalysed(
-        channel_map, since=since, limit=limit
+        channel_map(cfg, posts), since=since, limit=limit
     )
     print(f"\n{analysed} analysed, {skipped} skipped")
 
@@ -88,7 +99,8 @@ def main() -> None:
 
     cfg = load_config(args.config).with_analysis_profile(args.profile)
     with Database(cfg.storage.db_path) as db:
-        report(db.get_unanalysed_posts())
+        posts = db.get_unanalysed_posts()
+        report(posts)
         if args.drain is None:
             return
 
@@ -98,7 +110,7 @@ def main() -> None:
         since = datetime.fromisoformat(cutoff).replace(tzinfo=timezone.utc)
         print(f"\nDraining up to {args.drain} posts from {cutoff} "
               f"with profile {args.profile!r}...")
-        asyncio.run(drain(cfg, db, since, args.drain))
+        asyncio.run(drain(cfg, db, since, args.drain, posts))
 
 
 if __name__ == "__main__":
